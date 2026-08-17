@@ -7,6 +7,11 @@ per reader and per round.
 
 Built with PySide6, numpy and nibabel. No GPU, no server, no cloud.
 
+![The reading workspace](media/reading.png)
+
+*Every image on this page is of the synthetic phantom in `examples/`, not of
+anybody's scan.*
+
 ## What it is for
 
 A candidate list from an automated or prior manual pass arrives as a
@@ -129,9 +134,26 @@ from whichever sequence you choose, with every other segmented finding of the
 case alongside it. Lobar against deep is a statement about the pattern, and
 that is hard to assemble from three slice views.
 
+<p align="center">
+  <img src="media/lesion-3d.gif" width="330" alt="The mask turning in the head">
+  <img src="media/lesion-3d.png" width="330" alt="The mask on its own">
+</p>
+
 It is software-rendered: no OpenGL, because reading rooms are where remote
 desktops and software rasterisers live. A 5 mm lesion is 486 faces and 2.1 ms
 a frame.
+
+## Try it without your own data
+
+```powershell
+python examples/make_demo_data.py --open
+```
+
+That writes a phantom head with a few dark spots standing in for microbleeds,
+and a findings workbook pointing at them — two cases, five findings, enough to
+click through the whole loop. It prints the three environment variables to set;
+then `.\run_app.bat`. Nothing in it comes from a scan of anybody, which is why
+the pictures above could be published.
 
 ## Multiple readers
 
@@ -175,13 +197,19 @@ python -m unittest tests.test_core tests.test_desktop_app
 
 Like that, 42 tests run — the geometry, the region growing, the surface and
 projection maths, the store — and the rest are held back as needing a dataset.
-Point it at one and the whole suite runs:
+Point it at a study and the whole suite runs:
 
 ```powershell
 $env:TEST_SOURCE_XLSX = 'C:\studies\findings.xlsx'
 $env:TEST_DATA_ROOT   = 'C:\studies\Data'
 python -m unittest tests.test_core tests.test_desktop_app
 ```
+
+A study, not the demo phantom: several of these were written against real
+acquisitions and assume things the phantom does not have — more than one case
+per finding list, a full-size matrix, tissue texture for the interpolation
+checks. The phantom is for driving the application, not for satisfying the
+suite.
 
 Most of these exist because something was measured: the figures quoted above
 are in the suite as the thresholds it asserts.

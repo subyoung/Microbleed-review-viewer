@@ -18,6 +18,7 @@ config.json
 # live segmentations with.
 labels/
 Data/
+examples/demo/
 *.xlsx
 *.xls
 *.csv

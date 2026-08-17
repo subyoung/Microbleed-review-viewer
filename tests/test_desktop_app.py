@@ -1742,6 +1742,11 @@ class DesktopViewerTests(unittest.TestCase):
             self.settings, self.window.dataset, config=dataset_config.validate({})
         )
         try:
+            # The paths have to be ones that exist, or _accept stops on those
+            # before it ever looks at the format.
+            dialog.workbook_edit.setText(str(self.source))
+            dialog.data_edit.setText(str(self.data_root))
+            dialog.db_edit.setText(str(self.db_path))
             self.assertFalse(
                 dialog.format_section.is_expanded(),
                 "a study that matches the defaults should not be asked eight questions",
