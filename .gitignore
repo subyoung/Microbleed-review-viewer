@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+
+# This machine's dataset paths.
+local.ps1
+config.json
+
+# The review store and everything it derives.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# Study data.  None of this belongs in a repository: the workbook and the
+# exports carry subject identifiers, and a label file without the rows that
+# say which integer is which finding decodes to nothing -- so tracking one
+# without the other is a half-backup that a stray checkout could write over
+# live segmentations with.
+labels/
+Data/
+*.xlsx
+*.xls
+*.csv
+*.nii
+*.nii.gz
+*.mat
+!examples/*.xlsx
+
+# Development notes live in the working repository, not in this one.
+docs/

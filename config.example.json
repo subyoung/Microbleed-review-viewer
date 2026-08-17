@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "Copy this file to config.json and edit it. Every key is optional: what",
+    "you leave out keeps its default, so a study that matches the defaults",
+    "needs no file at all. The dataset dialog in the app writes this file for",
+    "you, so editing by hand is a convenience rather than a requirement.",
+    "",
+    "The three MICROBLEED_* environment variables, if set, win over paths",
+    "given here -- that is how a launcher opens a second study without",
+    "touching anyone's saved configuration."
+  ],
+
+  "dataset_name": "Example study",
+
+  "paths": {
+    "workbook": "",
+    "data_root": "",
+    "review_database": ""
+  },
+
+  "workbook": {
+    "_comment": "The sheet the findings are on, and what its columns are called. Only case_id, the three RAS columns and verify are required; leave any other name empty and that column is simply not read.",
+    "sheet": "MCH-microhemorrage",
+    "columns": {
+      "case_id": "subjectid",
+      "ras_l": "RAS L-R L",
+      "ras_p": "RAS P-A A",
+      "ras_s": "RAS I-S S",
+      "verify": "verify (yes=1)",
+      "slice": "slicecount",
+      "region": "atlasregions",
+      "ras_verified": "RAS verified",
+      "flag_2d_qsm": "2DQSM",
+      "flag_swi": "SWI",
+      "flag_3d_qsm": "3DQSM",
+      "readers": "readers",
+      "adjudicate": "need adjudicate",
+      "comments": "comments"
+    }
+  },
+
+  "sequences": {
+    "_comment": "Three slots, fixed in number because there are three toolbar buttons and three shortcuts. A sequence is recognised by the END of its filename; everything before it (subject, date, protocol) is free. 'required' false means a case without it still counts as readable. 'segmentable' false means no mask may be drawn on it -- correct for a projection, which smears a lesion along the projection direction.",
+    "swi": {
+      "label": "SWI",
+      "short": "SWI",
+      "suffix": "_GRE4_SWI_AffineRestored.nii.gz",
+      "required": true,
+      "segmentable": true
+    },
+    "qsm": {
+      "label": "QSM",
+      "short": "QSM",
+      "suffix": "_chi_nSFCR+0_Avg_AffineRestored.nii.gz",
+      "required": true,
+      "segmentable": true
+    },
+    "mip": {
+      "label": "SWI MIP",
+      "short": "MIP",
+      "suffix": "_GRE4_SWI_axiMIP2_AffineRestored.nii.gz",
+      "required": false,
+      "segmentable": false
+    }
+  }
+}
