@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 
+# PyInstaller output.
+build/
+dist/
+*.spec
+
 # This machine's dataset paths.
 local.ps1
 config.json

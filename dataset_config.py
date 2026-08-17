@@ -18,6 +18,7 @@ at all.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -99,8 +100,13 @@ class ConfigError(ValueError):
 def default_path(base_dir: Path | str | None = None) -> Path:
     """Where the configuration lives: beside the code, unless told otherwise."""
 
-    base = Path(base_dir) if base_dir else Path(__file__).resolve().parent
-    return base / CONFIG_NAME
+    if base_dir:
+        return Path(base_dir) / CONFIG_NAME
+    # Beside the executable in a packaged build, beside the code otherwise --
+    # see config.install_directory for why that distinction matters.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / CONFIG_NAME
+    return Path(__file__).resolve().parent / CONFIG_NAME
 
 
 def _merge(defaults: Any, given: Any) -> Any:

@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 
-BASE_DIR = Path(__file__).resolve().parent
+def install_directory() -> Path:
+    """Where this installation keeps the things that belong to it.
+
+    Running from source that is the folder holding these modules.  In a
+    PyInstaller build ``__file__`` points inside the bundle -- so the
+    configuration would be looked for, and the review database written, into
+    an internal directory the reader never sees and a reinstall replaces.
+    Beside the executable is where they belong.
+    """
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = install_directory()
 PROJECT_DIR = BASE_DIR.parent
 
 

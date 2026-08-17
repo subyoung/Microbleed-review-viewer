@@ -23,7 +23,13 @@ dataset it was written for, 69% of cases hold a single finding, so the loop is
 
 ## Install and run
 
-Windows, Python 3.12+:
+**No Python needed.** Download `MicrobleedReviewViewer-windows-x64.zip` from
+[Releases](../../releases), unzip it anywhere, and run
+`MicrobleedReviewViewer.exe`. It keeps `config.json` and, unless you point it
+elsewhere, its review database in its own folder, so the whole thing travels on
+a memory stick.
+
+From source instead — Windows, Python 3.12+:
 
 ```powershell
 .\install.bat                       # creates a venv outside any synced folder
@@ -213,6 +219,21 @@ suite.
 
 Most of these exist because something was measured: the figures quoted above
 are in the suite as the thresholds it asserts.
+
+## Building the standalone application
+
+```powershell
+python -m pip install pyinstaller
+python build_exe.py
+```
+
+That writes `dist/MicrobleedReviewViewer/` and a zip beside it — about 150 MB
+unpacked, 60 MB zipped, most of it Qt. PyInstaller is not in
+`requirements.txt`: it is needed to make the build, never to run it.
+
+One folder rather than one file. A single-file build unpacks itself to a
+temporary directory on every launch, which for a Qt application is several
+seconds each time and reads as a hang.
 
 ## Licence
 
