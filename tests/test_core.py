@@ -2186,5 +2186,70 @@ class DatasetConfigTests(unittest.TestCase):
         self.assertEqual(found, sorted(found, key=len, reverse=True))
 
 
+class LabelPathTests(unittest.TestCase):
+    """A recorded label path has to survive the study being moved.
+
+    Readers keep their own database and the whole folder gets copied between
+    machines and drives.  An absolute path recorded at save time then names a
+    file that does not exist, while the file sits exactly where it always
+    does -- four rows in the working database had this, pointing at a drive
+    letter the study left months ago.
+    """
+
+    def setUp(self) -> None:
+        import review_store
+
+        self.review_store = review_store
+        self.folder = Path(tempfile.mkdtemp(prefix="microbleed_labelpath_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.folder, ignore_errors=True))
+        self.db = self.folder / "review.sqlite"
+
+    def _row(self, path_text: str) -> dict:
+        return {
+            "path": path_text,
+            "case_id": "CASE01",
+            "reader_id": "Reader One",
+            "review_round": 1,
+        }
+
+    def test_a_path_from_another_machine_still_finds_the_file(self) -> None:
+        expected = self.review_store.label_path(self.db, "CASE01", "Reader One", 1)
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.write_bytes(b"not really a nifti")
+
+        elsewhere = "D:" + chr(92) + "gone" + chr(92) + "CASE01_round1.nii.gz"
+        stale = self._row(elsewhere)
+        found = self.review_store.resolve_label_path(self.db, stale)
+        self.assertEqual(found, expected)
+        self.assertTrue(found.is_file())
+
+    def test_a_path_that_is_there_is_used_as_given(self) -> None:
+        actual = self.folder / "labels" / "elsewhere.nii.gz"
+        actual.parent.mkdir(parents=True, exist_ok=True)
+        actual.write_bytes(b"x")
+        found = self.review_store.resolve_label_path(self.db, self._row(str(actual)))
+        self.assertEqual(found.resolve(), actual.resolve())
+
+    def test_a_relative_path_is_read_against_the_database(self) -> None:
+        actual = self.folder / "labels" / "Reader_One" / "CASE01_round1.nii.gz"
+        actual.parent.mkdir(parents=True, exist_ok=True)
+        actual.write_bytes(b"x")
+        row = self._row(str(Path("labels") / "Reader_One" / "CASE01_round1.nii.gz"))
+        self.assertEqual(
+            self.review_store.resolve_label_path(self.db, row).resolve(), actual.resolve()
+        )
+
+    def test_what_is_written_down_is_relative_so_it_travels(self) -> None:
+        """The fix at the other end: a new row records a portable path."""
+
+        inside = self.review_store.label_path(self.db, "CASE01", "Reader One", 1)
+        written = self.review_store.relative_label_path(self.db, inside)
+        self.assertFalse(Path(written).is_absolute(), written)
+        self.assertIn("labels", written)
+        # And a genuinely foreign location is still describable.
+        outside = Path(tempfile.gettempdir()) / "elsewhere" / "CASE01_round1.nii.gz"
+        self.assertTrue(Path(self.review_store.relative_label_path(self.db, outside)).is_absolute())
+
+
 if __name__ == "__main__":
     unittest.main()

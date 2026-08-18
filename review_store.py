@@ -1957,7 +1957,10 @@ def collect_agreement_rows(db_path: Path) -> list[dict[str, Any]]:
     cache: dict[str, Any] = {}
 
     def mask_of(entry: dict[str, Any]):
-        path = str(entry["path"])
+        # Through the resolver: the recorded path may predate the study being
+        # moved, and a comparison silently dropped for that reason would look
+        # like two readers who never overlapped.
+        path = str(resolve_label_path(db_path, entry))
         if path not in cache:
             try:
                 import nibabel as nib
@@ -2193,12 +2196,15 @@ def _merge_rois(
         destination = copied.get((case_id, reader_id, new_round))
         if destination is None:
             destination = label_path(target_db, case_id, reader_id, new_round)
-            origin = Path(str(roi["path"]))
-            if not origin.is_file():
-                # The row named a file that is not here.  Fall back to where the
-                # source store would have kept it, in case the database was moved
-                # together with its labels but the recorded path is stale.
-                origin = label_path(source_db, case_id, reader_id, old_round)
+            origin = resolve_label_path(
+                source_db,
+                {
+                    "path": roi["path"],
+                    "case_id": case_id,
+                    "reader_id": reader_id,
+                    "review_round": old_round,
+                },
+            )
             if origin.is_file() and origin.resolve() != destination.resolve():
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(origin, destination)
@@ -2443,6 +2449,47 @@ def list_rois(db_path: Path, case_id: str, reader_id: str, review_round: int) ->
         connection.close()
 
 
+def resolve_label_path(db_path: Path, row: Any) -> Path:
+    """Where a recorded segmentation actually is now.
+
+    ``roi_labels.path`` used to hold an absolute path, which is right until
+    the study is moved to another drive or opened from another machine -- and
+    both are ordinary here, since readers keep their own database and the MRI
+    folder is shared.  A row would then name a file that does not exist while
+    the file sat where it always does.
+
+    The location is derivable, so the recorded path is a hint rather than the
+    truth: try it, then fall back to where this database keeps that reader's
+    labels.  New rows store it relative to the database, so they travel.
+    """
+
+    recorded = str(row["path"] if hasattr(row, "keys") else row.get("path", "") or "")
+    if recorded:
+        candidate = Path(recorded)
+        if not candidate.is_absolute():
+            candidate = Path(db_path).parent / candidate
+        if candidate.is_file():
+            return candidate
+    return label_path(
+        Path(db_path),
+        str(row["case_id"]),
+        str(row["reader_id"]),
+        int(row["review_round"]),
+    )
+
+
+def relative_label_path(db_path: Path, path: Path) -> str:
+    """How a label path is written down: relative to the database when it can be."""
+
+    path = Path(path)
+    try:
+        return str(path.resolve().relative_to(Path(db_path).resolve().parent))
+    except ValueError:
+        # Somewhere else entirely; an absolute path is the only thing that
+        # could describe it.
+        return str(path)
+
+
 def save_roi(
     db_path: Path,
     *,
@@ -2508,7 +2555,7 @@ def save_roi(
                     reader_id,
                     review_round,
                     int(label_value),
-                    str(path),
+                    relative_label_path(db_path, path),
                     int(voxel_count),
                     float(volume_mm3),
                     float(centroid_ras[0]) if centroid_ras else None,
