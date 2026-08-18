@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -2249,6 +2250,99 @@ class LabelPathTests(unittest.TestCase):
         # And a genuinely foreign location is still describable.
         outside = Path(tempfile.gettempdir()) / "elsewhere" / "CASE01_round1.nii.gz"
         self.assertTrue(Path(self.review_store.relative_label_path(self.db, outside)).is_absolute())
+
+
+class ReaderRemovalTests(unittest.TestCase):
+    """Test readers accumulate, and the export gives every one of them a block.
+
+    One left over from an early prototype was fifteen of the fifty columns in
+    the findings sheet, and it counted as a second opinion on a finding it had
+    never seen -- the agreement column read "agree yes" between a real reader
+    and an artefact.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        source = os.environ.get("TEST_SOURCE_XLSX")
+        if not source:
+            raise unittest.SkipTest("Set TEST_SOURCE_XLSX to a readable copy of the workbook.")
+        cls.source = Path(source)
+        cls.data_root = Path(os.environ.get("TEST_DATA_ROOT", VIEWER_DIR.parent / "Data"))
+
+    def setUp(self) -> None:
+        import review_store
+
+        self.review_store = review_store
+        self.folder = Path(tempfile.mkdtemp(prefix="microbleed_removal_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.folder, ignore_errors=True))
+        self.db = self.folder / "review.sqlite"
+        review_store.initialize_store(self.source, self.data_root, self.db)
+        self.case = _sample_case(self.db)
+        self.target = str(list_targets(self.db, self.case, "Real", 1)[0]["target_id"])
+
+        for reader in ("Real", "Ghost QA"):
+            review_store.start_new_session(self.db, reader)
+            review_store.save_review(
+                self.db, target_id=self.target, case_id=self.case, reader_id=reader,
+                review_round=1, verify=1, comment=reader + " said so",
+            )
+
+    def _run(self, *arguments) -> int:
+        import subprocess
+
+        script = VIEWER_DIR / "tools" / "remove_reader.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--database", str(self.db), *arguments],
+            capture_output=True, text=True,
+        )
+        self.output = result.stdout + result.stderr
+        return result.returncode
+
+    def test_a_dry_run_changes_nothing(self) -> None:
+        before = self.db.read_bytes()
+        self.assertEqual(self._run("--reader", "Ghost QA"), 0)
+        self.assertIn("Nothing written", self.output)
+        self.assertEqual(self.db.read_bytes(), before, "the dry run wrote to the database")
+
+    def test_removing_a_reader_takes_it_out_of_the_export(self) -> None:
+        from openpyxl import load_workbook
+
+        before = self.folder / "before.xlsx"
+        export_reviews(self.db, before)
+        headers = [c.value for c in next(load_workbook(before, read_only=True)["findings"].iter_rows(max_row=1))]
+        self.assertTrue([h for h in headers if h and "Ghost QA" in str(h)], "the test reader was not in the export to begin with")
+
+        self.assertEqual(self._run("--reader", "Ghost QA", "--apply"), 0)
+
+        after = self.folder / "after.xlsx"
+        export_reviews(self.db, after)
+        book = load_workbook(after, read_only=True)
+        headers = [c.value for c in next(book["findings"].iter_rows(max_row=1))]
+        self.assertEqual([h for h in headers if h and "Ghost QA" in str(h)], [])
+        self.assertTrue([h for h in headers if h and "Real" in str(h)], "it took the real reader too")
+
+        # And the finding is no longer credited with two opinions.
+        rows = list(book["findings"].iter_rows(values_only=True))
+        index = list(rows[0])
+        agreement = rows[1 + [r[index.index("target_id")] for r in rows[1:]].index(self.target)]
+        self.assertEqual(agreement[index.index("readers_with_verdict")], 1)
+        self.assertEqual(agreement[index.index("agreement")], "single reader")
+        book.close()
+
+    def test_it_backs_the_database_up_before_writing(self) -> None:
+        self._run("--reader", "Ghost QA", "--apply")
+        backups = sorted(self.folder.glob("review.before-*.sqlite"))
+        self.assertEqual(len(backups), 1, "no backup was taken")
+        restored = sqlite3.connect(backups[0])
+        kept = restored.execute(
+            "SELECT COUNT(*) FROM review_annotations WHERE reader_id = ?", ("Ghost QA",)
+        ).fetchone()[0]
+        restored.close()
+        self.assertEqual(kept, 1, "the backup does not have the removed reader in it")
+
+    def test_an_unknown_reader_is_refused_rather_than_silently_doing_nothing(self) -> None:
+        self.assertEqual(self._run("--reader", "Nobody At All", "--apply"), 1)
+        self.assertIn("Nothing recorded", self.output)
 
 
 if __name__ == "__main__":

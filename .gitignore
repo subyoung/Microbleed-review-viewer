@@ -12,6 +12,7 @@ config.json
 
 # The review store and everything it derives.
 *.sqlite
+*.before-*.sqlite
 *.sqlite-shm
 *.sqlite-wal
 *.log
