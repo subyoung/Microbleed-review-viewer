@@ -103,6 +103,313 @@ class DesktopViewerTests(unittest.TestCase):
             self.app.processEvents()
         return bool(predicate())
 
+    # ----------------------------------------------- external segmentations --
+    def _external_folder(self, *, probability: bool = False) -> Path:
+        """A results folder for the open case, on the open case's own grid.
+
+        Written through the same path a saved mask takes, so the file that
+        comes back is voxel-for-voxel the one the viewer would compare
+        against -- a test that writes its own affine would pass while the
+        viewer refused every real file.
+        """
+
+        import nibabel as nib
+
+        from imaging import save_label_volume, to_source_orientation
+
+        reference = self.window._label_reference()
+        assert reference is not None
+        folder = self.temp_dir / "results" / self.case_id / "models"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        mask = np.zeros(reference.shape, dtype=np.uint16)
+        centre = tuple(int(size // 2) for size in reference.shape)
+        mask[centre[0] - 1:centre[0] + 2, centre[1] - 1:centre[1] + 2, centre[2]] = 1
+        # A second detection, far enough away to stay a second detection.
+        mask[centre[0] + 20, centre[1] + 20, centre[2]] = 1
+        save_label_volume(folder / "model_prediction.nii.gz", mask, reference)
+
+        if probability:
+            soft = np.zeros(reference.shape, dtype=np.float32)
+            soft[centre[0] - 1:centre[0] + 2, centre[1] - 1:centre[1] + 2, centre[2]] = 0.9
+            soft[centre[0] + 3, centre[1], centre[2]] = 0.4
+            # Enough distinct values that it reads as a probability map.
+            soft[0, 0, :16] = np.linspace(0.01, 0.3, 16)
+            restored = to_source_orientation(soft, reference)
+            nib.save(
+                nib.Nifti1Image(
+                    np.asarray(restored.dataobj, dtype=np.float32),
+                    np.asarray(restored.affine, dtype=np.float64),
+                ),
+                str(folder / "model_probability.nii.gz"),
+            )
+        return self.temp_dir / "results"
+
+    def _turn_on_developer_mode(self, root: Path, pattern: str = "./models") -> None:
+        self.settings.set_external_results(str(root), pattern)
+        self.window._set_developer_mode(True)
+        self.window._refresh_external_panel()
+
+    def test_the_external_tab_is_hidden_until_developer_mode_is_turned_on(self) -> None:
+        index = self.window._panel_tab_keys.index("external")
+        self.assertFalse(
+            self.window.panel_tabs.isTabVisible(index),
+            "a reader is shown a detector's guesses without asking for them",
+        )
+        self._turn_on_developer_mode(self._external_folder())
+        self.assertTrue(self.window.panel_tabs.isTabVisible(index))
+
+        # And it is not there for the cases that have nothing behind it.
+        self._turn_on_developer_mode(self.temp_dir / "empty_results")
+        self.assertFalse(
+            self.window.panel_tabs.isTabVisible(index),
+            "an empty tab on every case is a thing to click and find nothing in",
+        )
+        self._turn_on_developer_mode(self._external_folder())
+
+        # And it puts everything away again, including what is on the images.
+        self.window.external_combo.setCurrentIndex(1)
+        self.assertIsNotNone(self.window.external_mask)
+        self.window._set_developer_mode(False)
+        self.assertFalse(self.window.panel_tabs.isTabVisible(index))
+        self.assertIsNone(self.window.external_mask)
+        self.assertIsNone(self.window.view_panels["axial"].canvas._external_volume)
+
+    def test_cases_with_a_result_are_marked_in_the_queue(self) -> None:
+        rows = lambda: [
+            self.window.case_list.item(index).text()
+            for index in range(self.window.case_list.count())
+        ]
+        self.assertFalse([row for row in rows() if "*" in row])
+
+        self._turn_on_developer_mode(self._external_folder())
+        marked = [row for row in rows() if "*" in row]
+        self.assertEqual(len(marked), 1, "the one case with a result is not marked")
+        self.assertTrue(
+            marked[0].startswith(f"{self.case_id}*"),
+            f"the mark is not on the identifier: {marked[0]!r}",
+        )
+
+        # And the filter for them, which only exists in developer mode.
+        self.window.external_only_cb.setChecked(True)
+        self.assertEqual(len(rows()), 1, "the filter did not narrow to the marked case")
+        self.window.external_only_cb.setChecked(False)
+        self.assertGreater(len(rows()), 1)
+
+    def test_both_folder_layouts_are_readable(self) -> None:
+        root = self._external_folder()
+        self._turn_on_developer_mode(root, "./models")
+        self.assertEqual(self.window.external_combo.count(), 2)
+        # The same run, described the other way round: nothing sits directly
+        # in the case folder, so nothing is found.
+        self._turn_on_developer_mode(root, ".")
+        self.assertEqual(self.window.external_combo.count(), 1)
+        self.assertIn("Nothing for", self.window.external_note.text())
+
+    def test_a_binary_result_is_shown_counted_and_offered_no_threshold(self) -> None:
+        self._turn_on_developer_mode(self._external_folder())
+        self.window.external_combo.setCurrentIndex(1)
+
+        self.assertEqual(self.window.external_kind, "mask")
+        self.assertTrue(
+            self.window.external_threshold_row.isHidden(),
+            "a threshold control over a hard segmentation is a knob that does nothing",
+        )
+        self.assertEqual(len(self.window.external_blobs), 2)
+        self.assertEqual(self.window.external_blob_list.count(), 2)
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 10)
+        for panel in self.window.view_panels.values():
+            self.assertIsNotNone(panel.canvas._external_volume)
+
+    def test_a_probability_map_is_recognised_and_follows_its_threshold(self) -> None:
+        self._turn_on_developer_mode(self._external_folder(probability=True))
+        names = [
+            self.window.external_combo.itemText(index)
+            for index in range(self.window.external_combo.count())
+        ]
+        self.window.external_combo.setCurrentIndex(names.index("model_probability"))
+
+        self.assertEqual(self.window.external_kind, "probability")
+        self.assertFalse(self.window.external_threshold_row.isHidden())
+        self.assertAlmostEqual(self.window.external_threshold_spin.value(), 0.5)
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 9)
+        self.assertIn("0.50", self.window.external_readout.text())
+
+        # Moving the number changes nothing until Apply: re-thresholding
+        # twelve million voxels on every step of a drag is the lurch this
+        # replaced.
+        self.window.external_threshold_spin.setValue(0.35)
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 9)
+        self.assertTrue(self.window.external_apply_btn.isEnabled())
+        self.assertIn("press Apply", self.window.external_readout.text())
+
+        self.window._apply_external_threshold()
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 10)
+        self.assertFalse(self.window.external_apply_btn.isEnabled())
+        self.assertNotIn("press Apply", self.window.external_readout.text())
+
+        self.window.external_threshold_spin.setValue(0.95)
+        self.window._apply_external_threshold()
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 0)
+        self.assertIn("nothing above this threshold", self.window.external_readout.text())
+
+        # The slider and the box are two handles on one number.
+        self.window.external_threshold_slider.setValue(35)
+        self.assertAlmostEqual(self.window.external_threshold_spin.value(), 0.35)
+        self.window._apply_external_threshold()
+        self.assertEqual(int(np.count_nonzero(self.window.external_mask)), 10)
+
+    def test_clicking_a_detection_moves_the_views_to_it(self) -> None:
+        self._turn_on_developer_mode(self._external_folder())
+        self.window.external_combo.setCurrentIndex(1)
+        before = tuple(self.window.target_ras)
+        marker = tuple(self.window.marker_ras)
+
+        self.window.external_blob_list.setCurrentRow(0)
+        self.assertNotEqual(tuple(self.window.target_ras), before)
+        canvas = self.window.view_panels["axial"].canvas
+        self.assertTrue(
+            np.any(canvas._external_slice()),
+            "the views moved somewhere the detection is not",
+        )
+        # Navigation only. The finding under review keeps its own coordinate,
+        # or looking at a model's output would quietly rewrite the data.
+        self.assertEqual(tuple(self.window.marker_ras), marker)
+
+    def test_comparison_scores_the_result_against_every_mask_of_the_case(self) -> None:
+        self._turn_on_developer_mode(self._external_folder())
+        self.window.external_combo.setCurrentIndex(1)
+        self.window.external_compare_cb.setChecked(True)
+        self.assertIn("not segmented", self.window.external_readout.text())
+
+        # Paint the reader's own mask over exactly half of the model's, and
+        # the sentence has to say so.
+        mask = np.asarray(self.window.external_mask)
+        coords = np.argwhere(mask)[:5]
+        value = self.window._label_value_for(self.window.selected_target["target_id"])
+        self.window.label_volume[tuple(coords.T)] = value
+        self.window._update_external_readout()
+
+        text = self.window.external_readout.text()
+        self.assertIn("Dice 0.667", text)
+        # Counted off the volume that was scored, not off what has been saved:
+        # this mask has not reached the database and it is still in the dice.
+        self.assertIn("your 1 mask", text)
+        self.assertIn("both 5", text)
+        self.assertIn("theirs only 5", text)
+
+        # In compare mode the canvas draws the two together rather than the
+        # reader's mask twice.
+        canvas = self.window.view_panels["axial"].canvas
+        self.assertTrue(canvas._external_compare)
+
+        # Comparing against an overlay that is switched off would show the
+        # model's mask and none of the reader's, which reads as a model that
+        # found what the reader missed.
+        self.window.show_roi_cb.setChecked(False)
+        self.window.external_show_cb.setChecked(False)
+        self.window.external_compare_cb.setChecked(False)
+        self.window.external_compare_cb.setChecked(True)
+        self.assertTrue(self.window.show_roi_cb.isChecked())
+        self.assertTrue(self.window.external_show_cb.isChecked())
+        self.assertTrue(self.window.view_panels["axial"].canvas._external_compare)
+
+        # And the empty entry is the way back out.
+        self.window.external_combo.setCurrentIndex(0)
+        self.assertIsNone(self.window.external_mask)
+        self.assertIsNone(canvas._external_volume)
+
+    def test_a_result_on_another_grid_is_refused_rather_than_resampled(self) -> None:
+        import nibabel as nib
+
+        import external_results
+
+        root = self._external_folder()
+        self._turn_on_developer_mode(root)
+        self.window.external_combo.setCurrentIndex(1)
+
+        wrong = self.temp_dir / "wrong_grid.nii.gz"
+        nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.uint8), np.eye(4)), str(wrong))
+        self.window.load_external_result(
+            external_results.ExternalResult(self.case_id, wrong.name, wrong)
+        )
+        self.assertIsNone(self.window.external_mask)
+        self.assertIn("not on this case's voxel grid", self.window._status_label.text())
+
+    def test_the_result_is_dropped_when_the_case_changes(self) -> None:
+        self._turn_on_developer_mode(self._external_folder())
+        self.window.external_combo.setCurrentIndex(1)
+        self.assertIsNotNone(self.window.external_mask)
+
+        other = next(
+            item["case_id"]
+            for item in self.window.all_cases
+            if item["case_id"] != self.case_id
+        )
+        self.window.load_case(other)
+        self.assertIsNone(
+            self.window.external_mask,
+            "one case's model output stayed on screen over another case's images",
+        )
+        self.assertIsNone(self.window.view_panels["axial"].canvas._external_volume)
+
+    def test_the_two_overlays_have_a_key_each(self) -> None:
+        """S is this reader's mask; Shift+S is the other one.
+
+        One key for both would mean a reader comparing two masks has to reach
+        for the mouse to hide either of them.
+        """
+
+        self._turn_on_developer_mode(self._external_folder())
+        self.window.external_combo.setCurrentIndex(1)
+        canvas = self.window.view_panels["axial"].canvas
+
+        self.assertEqual(self.settings.shortcut("toggle_external_overlay"), "Shift+S")
+        self.assertNotEqual(
+            self.settings.shortcut("toggle_roi_overlay"),
+            self.settings.shortcut("toggle_external_overlay"),
+        )
+
+        self.window._toggle_external_overlay_key()
+        self.assertIsNone(canvas._external_volume, "Shift+S did not take it off")
+        self.assertTrue(canvas._show_labels, "Shift+S took the reader's own mask off too")
+        self.window._toggle_external_overlay_key()
+        self.assertIsNotNone(canvas._external_volume)
+
+        self.window.show_roi_cb.toggle()
+        self.assertFalse(canvas._show_labels)
+        self.assertIsNotNone(canvas._external_volume, "S took the external mask off too")
+
+    def test_a_case_load_never_leaves_the_window_open_to_clicks(self) -> None:
+        """The progress dialog is modal, or it is decoration.
+
+        Loading holds the GUI thread, and the events that arrive during it are
+        replayed afterwards unless something else is there to take them. The
+        dialog is that something else.
+        """
+
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QPushButton
+
+        progress = self.desktop_app.LoadProgress(self.window, "Opening…", steps=2)
+        try:
+            self.assertEqual(
+                progress._dialog.windowModality(), Qt.WindowModality.ApplicationModal
+            )
+            self.assertIsNone(
+                progress._dialog.findChild(QPushButton), "a cancel that cannot cancel"
+            )
+            # Not shown yet: a 470 ms local load should not flash a dialog.
+            self.assertFalse(progress._dialog.isVisible())
+            progress.show_now()
+            self.assertTrue(progress._dialog.isVisible())
+            progress.busy("Downloading…")
+            self.assertEqual((progress._dialog.minimum(), progress._dialog.maximum()), (0, 0))
+            progress.measured(2, 1)
+            self.assertEqual(progress._dialog.value(), 1)
+        finally:
+            progress.close()
+
     def test_finding_and_manual_ras_use_the_same_physical_target(self) -> None:
         target = self.review_store.list_targets(self.db_path, self.case_id, "Desktop Test Reader", 1)[0]
         expected = (float(target["ras"][0]), float(target["ras"][1]), float(target["ras"][2]))

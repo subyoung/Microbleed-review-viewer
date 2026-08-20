@@ -2345,5 +2345,182 @@ class ReaderRemovalTests(unittest.TestCase):
         self.assertIn("Nothing recorded", self.output)
 
 
+class ExternalResultsTests(unittest.TestCase):
+    """Reading somebody else's segmentations off disk.
+
+    All synthetic: the point is the rules -- which folder layout is found,
+    what counts as a probability map, how two masks are scored -- and none of
+    those need a study's data to be exercised.
+    """
+
+    def setUp(self) -> None:
+        import external_results
+
+        self.module = external_results
+        self.folder = Path(tempfile.mkdtemp(prefix="external_results_test_"))
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def _write(self, relative: str, data: np.ndarray) -> Path:
+        import nibabel as nib
+
+        target = self.folder / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(target))
+        return target
+
+    def test_it_finds_results_in_the_case_folder_or_a_subfolder_of_it(self) -> None:
+        mask = np.zeros((4, 4, 4), dtype=np.uint8)
+        self._write("CASE_A/models/model_one.nii.gz", mask)
+        self._write("CASE_A/models/model_two.nii.gz", mask)
+        self._write("CASE_A/loose_file.nii.gz", mask)
+        self._write("CASE_B/models/model_one.nii.gz", mask)
+
+        # Both layouts exist in real runs, which is exactly why the pattern is
+        # asked for rather than guessed.
+        at_root = self.module.discover(self.folder, ".")
+        self.assertEqual(sorted(at_root), ["CASE_A"])
+        self.assertEqual([entry.label for entry in at_root["CASE_A"]], ["loose_file"])
+
+        in_models = self.module.discover(self.folder, "./models")
+        self.assertEqual(sorted(in_models), ["CASE_A", "CASE_B"])
+        self.assertEqual(
+            [entry.label for entry in in_models["CASE_A"]], ["model_one", "model_two"]
+        )
+        # The same folder, however it is typed.
+        for spelling in ("models", "./models", "models/", chr(92) + "models"):
+            self.assertEqual(
+                sorted(self.module.discover(self.folder, spelling)),
+                ["CASE_A", "CASE_B"],
+                spelling,
+            )
+
+    def test_a_folder_with_nothing_in_it_is_not_an_error(self) -> None:
+        self.assertEqual(self.module.discover(self.folder / "missing", "."), {})
+        (self.folder / "CASE_C").mkdir()
+        self.assertEqual(self.module.discover(self.folder, "."), {})
+
+    def test_it_tells_a_probability_map_from_a_hard_segmentation(self) -> None:
+        labels = np.zeros((8, 8, 8), dtype=np.uint8)
+        labels[2:4, 2:4, 2:4] = 1
+        self.assertEqual(self.module.classify(labels), "mask")
+        # A binary mask stored as float is still a mask: the file says nothing
+        # useful about its own type, so the data has to.
+        self.assertEqual(self.module.classify(labels.astype(np.float32)), "mask")
+
+        rng = np.random.default_rng(0)
+        probabilities = rng.random((8, 8, 8)).astype(np.float32)
+        self.assertEqual(self.module.classify(probabilities), "probability")
+
+    def test_dice_comes_with_the_counts_that_say_what_it_means(self) -> None:
+        ours = np.zeros((6, 6, 6), dtype=bool)
+        theirs = np.zeros((6, 6, 6), dtype=bool)
+        ours[1:4, 1, 1] = True
+        theirs[2:6, 1, 1] = True
+        scores = self.module.compare(ours, theirs, voxel_mm3=2.0)
+        self.assertEqual(scores["both_voxels"], 2)
+        self.assertEqual(scores["only_ours_voxels"], 1)
+        self.assertEqual(scores["only_theirs_voxels"], 2)
+        self.assertAlmostEqual(scores["dice"], 4 / 7)
+        self.assertAlmostEqual(scores["both_mm3"], 4.0)
+
+        # Two empty masks agree on nothing rather than perfectly.
+        empty = self.module.compare(np.zeros((3, 3, 3)), np.zeros((3, 3, 3)), 1.0)
+        self.assertEqual(empty["dice"], 0.0)
+
+    def test_separate_detections_stay_separate(self) -> None:
+        mask = np.zeros((10, 10, 10), dtype=bool)
+        mask[1, 1, 1] = True                 # one voxel
+        mask[5:7, 5:7, 5] = True             # four, touching each other
+        mask[9, 9, 9] = True                 # one, in a corner
+        blobs = self.module.components(mask)
+        self.assertEqual([int(blob["voxels"]) for blob in blobs], [4, 1, 1])
+        # Largest first, and each carries the voxels it is made of so it can
+        # be drawn on its own.
+        self.assertEqual(len(blobs[0]["coords"]), 4)
+        self.assertTrue(np.allclose(blobs[0]["centre"], [5.5, 5.5, 5.0]))
+        self.assertEqual(self.module.components(np.zeros((4, 4, 4), dtype=bool)), [])
+
+    def test_a_diagonal_touch_is_two_detections_not_one(self) -> None:
+        # Six-connectivity on purpose: two microbleeds that happen to touch at
+        # a corner are two lesions, and counting them as one understates what
+        # a detector found.
+        mask = np.zeros((5, 5, 5), dtype=bool)
+        mask[1, 1, 1] = True
+        mask[2, 2, 2] = True
+        self.assertEqual(len(self.module.components(mask)), 2)
+
+    def test_a_different_grid_is_reported_rather_than_resampled(self) -> None:
+        import nibabel as nib
+
+        reference = nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.uint8), np.eye(4))
+        same = nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.uint8), np.eye(4))
+        self.assertTrue(self.module.geometry_matches(same, reference))
+
+        shifted = np.eye(4)
+        shifted[2, 3] = 1.0
+        self.assertFalse(
+            self.module.geometry_matches(
+                nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.uint8), shifted), reference
+            )
+        )
+        self.assertFalse(
+            self.module.geometry_matches(
+                nib.Nifti1Image(np.zeros((8, 8, 4), dtype=np.uint8), np.eye(4)), reference
+            )
+        )
+
+
+class CloudFileTests(unittest.TestCase):
+    """Files that have to be downloaded before they can be read.
+
+    The study here lives on OneDrive, where 124 of the 500 sequence files are
+    placeholders at any moment. Getting this wrong in either direction is
+    expensive: miss one and the window freezes with no explanation, claim one
+    that is local and every case switch grows a pointless extra read.
+    """
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="cloud_test_"))
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_an_ordinary_file_is_not_treated_as_cloud_only(self) -> None:
+        from imaging import is_cloud_only
+
+        local = self.folder / "here.bin"
+        local.write_bytes(b"x" * 1024)
+        self.assertFalse(is_cloud_only(local))
+        # A path that is not there at all is not a download waiting to happen;
+        # the loader has its own words for a missing file.
+        self.assertFalse(is_cloud_only(self.folder / "gone.bin"))
+
+    def test_reading_a_file_through_reports_its_whole_size(self) -> None:
+        from imaging import fetch_local_copy
+
+        payload = self.folder / "payload.bin"
+        payload.write_bytes(b"y" * (5 * 1024 * 1024 + 17))
+        # Deliberately smaller than the file so the loop runs more than once.
+        self.assertEqual(
+            fetch_local_copy(payload, chunk_bytes=1024 * 1024),
+            payload.stat().st_size,
+        )
+
+    def test_the_attribute_bits_are_the_ones_windows_uses(self) -> None:
+        import imaging
+
+        # Named constants, checked against their documented values: a typo
+        # here would silently mean "no file is ever in the cloud".
+        self.assertEqual(imaging.FILE_ATTRIBUTE_OFFLINE, 0x1000)
+        self.assertEqual(imaging.FILE_ATTRIBUTE_RECALL_ON_OPEN, 0x40000)
+        self.assertEqual(imaging.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, 0x400000)
+
+
 if __name__ == "__main__":
     unittest.main()

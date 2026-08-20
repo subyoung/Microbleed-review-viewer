@@ -21,6 +21,8 @@ state and logs use the shared SQLite store from ``review_store.py``.
 """
 
 import faulthandler
+import threading
+import time
 import json
 import math
 import os
@@ -29,7 +31,7 @@ from datetime import datetime
 from collections import OrderedDict
 from pathlib import Path
 from queue import Queue
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -84,6 +86,7 @@ try:  # Keep the import error useful when somebody launches before installing.
         QMainWindow,
         QMenu,
         QMessageBox,
+        QProgressDialog,
         QPushButton,
         QScrollArea,
         QSizePolicy,
@@ -114,6 +117,8 @@ try:
         icon_file,
     )
     import dataset_config
+    import external_results
+    from external_results import ExternalResult
     from imaging import (
         DEFAULT_ORIENTATION,
         DISPLAY_AXCODES,
@@ -129,7 +134,9 @@ try:
         project_context,
         plane_direction_labels,
         preset_axcodes,
-        save_label_volume,
+        fetch_local_copy,
+    is_cloud_only,
+    save_label_volume,
         segment_lesion,
         snap_to_extremum,
         ras_to_voxel,
@@ -266,6 +273,7 @@ SHORTCUT_ACTIONS: tuple[tuple[str, str, str, str], ...] = (
     ("tool_brush", "Brush on / off", "B", "Review"),
     ("tool_eraser", "Eraser on / off", "E", "Review"),
     ("toggle_roi_overlay", "Show / hide the segmentation", "S", "Review"),
+    ("toggle_external_overlay", "Show / hide the external segmentation", "Shift+S", "Review"),
     ("brush_smaller", "Smaller brush", "-", "Review"),
     ("brush_larger", "Larger brush", "=", "Review"),
     ("undo_roi", "Undo the last brush stroke", "Ctrl+Z", "Review"),
@@ -336,6 +344,13 @@ BACKGROUND_BUSY_TIMEOUT_MS = 2000
 # join a grown mask.  Chosen by sweeping thirty real findings: at 3.0 the
 # median mask is 3.6 mm across, which is where a microbleed on this data sits,
 # and the fewest masks either overrun the safety cap or collapse to the seed.
+# Above this many voxels above threshold, separating a result into
+# detections is neither quick nor useful -- see _rebuild_external_mask.
+EXTERNAL_BLOB_VOXEL_LIMIT = 20000
+EXTERNAL_BLOB_ROW_LIMIT = 200
+# Surfacing is per detection; beyond this the window is a cloud of specks and
+# the wait is what a reader notices instead.
+EXTERNAL_3D_BLOB_LIMIT = 60
 DEFAULT_GROW_SENSITIVITY = 3.0
 # Distinguishable on greyscale MRI, and distinct from the red finding marker.
 VARIANT_COLORS = ("#32d9e8", "#f2b000", "#7ee081", "#c58cff", "#4a9eff", "#ff8f6b")
@@ -391,6 +406,16 @@ COLORS = {
     "variant_source": "#e8edf5",
     "roi": "#ffd24a",
     "cursor": "#32d9e8",
+    # Somebody else's segmentation.  Deliberately nowhere near the yellow a
+    # reader's own mask is drawn in: the one question being asked of these
+    # overlays is which of the two you are looking at.
+    "external": "#b14aff",
+    # Side by side the three have to be told apart at a glance over grey
+    # matter, at lesion zoom, in a room with the lights down -- so they are
+    # the saturated versions rather than the softer ones used when a colour
+    # is on screen on its own.
+    "compare_ours": "#ffd400",
+    "compare_both": "#22e06a",
     "direction": "#f2b000",
 }
 
@@ -836,6 +861,32 @@ class ViewerSettings:
     @property
     def save_advances(self) -> bool:
         return self._bool("reading/save_advances", True)
+
+    @property
+    def developer_mode(self) -> bool:
+        """Show the tools for looking at somebody else's model output.
+
+        Off by default and out of the way: a reader judging findings should
+        not be shown a detector's guesses, because seeing them first is how a
+        reader stops reading and starts agreeing.
+        """
+
+        return self._bool("developer/enabled", False)
+
+    def set_developer_mode(self, enabled: bool) -> None:
+        self.store.setValue("developer/enabled", bool(enabled))
+
+    @property
+    def external_root(self) -> str:
+        return str(self.store.value("developer/external_root", "") or "")
+
+    @property
+    def external_pattern(self) -> str:
+        return str(self.store.value("developer/external_pattern", ".") or ".")
+
+    def set_external_results(self, root: str, pattern: str) -> None:
+        self.store.setValue("developer/external_root", str(root))
+        self.store.setValue("developer/external_pattern", str(pattern or "."))
 
     @property
     def keep_tool_on_switch(self) -> bool:
@@ -1705,6 +1756,199 @@ class ContrastDialog(QDialog):
             self.valuesChanged.emit(float(self.level_spin.value()), float(self.window_spin.value()))
 
 
+class LoadProgress:
+    """A modal bar for work that holds the whole window.
+
+    Loading is deliberately synchronous on the GUI thread -- a worker-thread
+    model crashed on Windows when a case was switched during a load -- so
+    while a case opens the window cannot repaint and cannot refuse a click.
+    Locally that lasts 470 ms and nobody notices.  From OneDrive the file has
+    to be downloaded first, which measured 2.05 s for one 28.6 MB sequence,
+    and a window that is grey and unresponsive for six seconds is a window
+    people click into.
+
+    So: modal, which is what actually stops the clicks (queued clicks are
+    delivered to the dialog and dropped rather than replayed into the window
+    afterwards), and shown only when the wait is real -- immediately when a
+    file has to come down from the cloud, otherwise not until the load has
+    already taken ``delay_ms``.
+
+    No cancel button.  Between files it could stop, but the wait people would
+    want to cancel is inside one download, where there is nothing to cancel.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        title: str,
+        *,
+        steps: int = 0,
+        delay_ms: int = 600,
+    ) -> None:
+        self._dialog = QProgressDialog(title, "", 0, max(steps, 0), parent)
+        self._dialog.setWindowTitle("Microbleed Review Viewer")
+        self._dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._dialog.setCancelButton(None)
+        self._dialog.setAutoClose(False)
+        self._dialog.setAutoReset(False)
+        self._dialog.setMinimumDuration(delay_ms)
+        self._dialog.setMinimumWidth(360)
+        # A dialog with a close button invites closing it, and the load would
+        # carry on regardless.
+        self._dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self._dialog.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self._dialog.setValue(0)
+
+    def step(self, text: str, value: int | None = None) -> None:
+        """Say what is happening now, and let the dialog paint it."""
+
+        self._dialog.setLabelText(text)
+        if value is not None:
+            self._dialog.setValue(value)
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def busy(self, text: str) -> None:
+        """For a wait with no measurable progress: an animated bar.
+
+        Used while a file comes down from OneDrive, where the download is not
+        incremental -- one read blocks for the whole file -- so a percentage
+        would be invented.  The bar says "still working", which is the only
+        true thing there is to say.
+        """
+
+        self._dialog.setRange(0, 0)
+        self.show_now()
+        self.step(text)
+
+    def measured(self, steps: int, value: int = 0) -> None:
+        self._dialog.setRange(0, max(steps, 1))
+        self._dialog.setValue(value)
+
+    def show_now(self) -> None:
+        """Skip the delay: the wait is already known to be a long one."""
+
+        self._dialog.setMinimumDuration(0)
+        self._dialog.show()
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def wait_for(self, finished: Callable[[], bool], text: str) -> None:
+        """Pump the event loop until a background read has finished.
+
+        The reading happens on a plain thread because it touches nothing but
+        the file: no Qt object, no numpy array, nothing this window owns.
+        That is what lets the bar animate and the modality hold while the
+        several seconds pass.
+        """
+
+        self.busy(text)
+        while not finished():
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 40
+            )
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        self._dialog.reset()
+        self._dialog.close()
+        self._dialog.deleteLater()
+
+
+class ExternalResultsDialog(QDialog):
+    """Where the model output lives, and where inside a case folder.
+
+    Two questions, because batch runs organise themselves differently and the
+    alternative is telling people to rename somebody else's output directory.
+    The count underneath is the answer to "did I type that right", which is
+    otherwise only discoverable by closing the dialog and looking.
+    """
+
+    def __init__(self, parent: QWidget | None, root: str, pattern: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("External segmentations")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        layout.addWidget(
+            _label(
+                "A folder holding one subfolder per case, named with the same case "
+                "identifiers as the review database. Nothing in it is ever written to.",
+                color=COLORS["dim"],
+                size=9,
+            )
+        )
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(6)
+        self.root_edit = QLineEdit(root)
+        self.root_edit.setPlaceholderText("…/results/selected_cases")
+        self.root_edit.textChanged.connect(self._recount)
+        folder_row.addWidget(self.root_edit, 1)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        folder_row.addWidget(browse)
+        layout.addLayout(folder_row)
+
+        pattern_row = QHBoxLayout()
+        pattern_row.setSpacing(6)
+        pattern_row.addWidget(_label("Inside each case folder:", color=COLORS["dim"], size=9, wrap=False))
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.setEditable(True)
+        self.pattern_combo.addItems([".", "./models", "./predictions", "./segmentations"])
+        self.pattern_combo.setCurrentText(pattern or ".")
+        self.pattern_combo.setToolTip(
+            "'.' reads the case folder itself; './models' reads that subfolder of it."
+        )
+        self.pattern_combo.currentTextChanged.connect(self._recount)
+        pattern_row.addWidget(self.pattern_combo, 1)
+        layout.addLayout(pattern_row)
+
+        self.count_label = _label("", color=COLORS["dim"], size=9)
+        self.count_label.setWordWrap(True)
+        layout.addWidget(self.count_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._recount()
+
+    def _browse(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Folder of model results", self.root_edit.text().strip() or str(Path.home())
+        )
+        if chosen:
+            self.root_edit.setText(chosen)
+
+    def _recount(self) -> None:
+        root = self.root_edit.text().strip()
+        if not root:
+            self.count_label.setText("No folder chosen.")
+            return
+        try:
+            found = external_results.discover(root, self.pattern_combo.currentText())
+        except OSError as exc:
+            self.count_label.setText(f"Cannot read that folder: {exc}")
+            return
+        if not found:
+            self.count_label.setText(
+                "No volumes found. If the files sit in a subfolder of each case, "
+                "name it above — for example ./models."
+            )
+            return
+        files = sum(len(entries) for entry, entries in found.items())
+        names = ", ".join(sorted(found)[:4])
+        more = "…" if len(found) > 4 else ""
+        self.count_label.setText(
+            f"{_human_count(len(found), 'case')}, {_human_count(files, 'file')} — {names}{more}"
+        )
+
+    def result(self) -> tuple[str, str]:
+        return self.root_edit.text().strip(), self.pattern_combo.currentText().strip() or "."
+
+
 class DatasetDialog(QDialog):
     """Choose the study to review: workbook, MRI folder and review database."""
 
@@ -2005,6 +2249,10 @@ class SliceCanvas(QWidget):
         # Segmentation: the label volume is shared with the window, so a stroke
         # here is immediately visible in the other two planes.
         self._label_volume: np.ndarray | None = None
+        # A model's output, thresholded to a mask by the window before it gets
+        # here.  Read only; nothing in the canvas ever writes to it.
+        self._external_volume: np.ndarray | None = None
+        self._external_compare = False
         self._label_value = 1
         self._show_labels = True
         # Outline rather than fill: a 40% wash over a 3 mm lesion at lesion
@@ -2387,6 +2635,18 @@ class SliceCanvas(QWidget):
         self._show_labels = bool(visible)
         self.update()
 
+    def set_external_overlay(self, mask: np.ndarray | None, *, compare: bool = False) -> None:
+        """A boolean volume from somewhere else, on this case's grid.
+
+        Thresholding happens in the window: a probability map has to become a
+        mask at some number, and which number is a reader's decision, not a
+        drawing detail.
+        """
+
+        self._external_volume = mask
+        self._external_compare = bool(compare)
+        self.update()
+
     def set_paint_mode(self, mode: str | None) -> None:
         """``"paint"``, ``"erase"`` or ``None`` for no drawing."""
 
@@ -2490,6 +2750,59 @@ class SliceCanvas(QWidget):
         patch[target] = 0 if erase else self._label_value
         self.update()
         return True
+
+    def _external_slice(self) -> np.ndarray | None:
+        if self._external_volume is None:
+            return None
+        index = int(np.clip(self._slice_index, 0, self._external_volume.shape[self.slice_axis] - 1))
+        return extract_plane(self._external_volume, self.plane, index)[0]
+
+    def _draw_external_overlay(self, painter: QPainter, rect: QRectF) -> None:
+        """The other segmentation, alone or set against this reader's own.
+
+        Alone it is one colour.  In compare mode it is three, because the
+        useful question is not "how much did it find" but which voxels only
+        one of the two of you claimed.
+        """
+
+        theirs = self._external_slice()
+        if theirs is None:
+            return
+        theirs = np.asarray(theirs, dtype=bool)
+        mine = None
+        if self._external_compare and self._show_labels and self._label_volume is not None:
+            labels = self._label_slice()
+            if labels is not None:
+                # Every mask of this case, not just the selected finding: the
+                # file being compared against covers the whole case, so
+                # scoring it against one finding would count the reader's
+                # other lesions as the model's mistakes.
+                mine = labels > 0
+        if not np.any(theirs) and (mine is None or not np.any(mine)):
+            return
+
+        height, width = theirs.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+
+        def paint(mask: np.ndarray, key: str, alpha: int) -> None:
+            if not np.any(mask):
+                return
+            shown = self._edge_of(mask) if self._label_outline else mask
+            colour = QColor(COLORS[key])
+            # QImage ARGB32 on a little-endian machine reads BGRA.
+            rgba[shown] = (colour.blue(), colour.green(), colour.red(), alpha)
+
+        solid = 245 if self._label_outline else 135
+        if mine is None:
+            paint(theirs, "external", solid)
+        else:
+            paint(mine & ~theirs, "compare_ours", solid)
+            paint(theirs & ~mine, "external", solid)
+            paint(mine & theirs, "compare_both", solid)
+        image = QImage(
+            rgba.data, int(width), int(height), int(rgba.strides[0]), QImage.Format.Format_ARGB32
+        ).copy()
+        painter.drawPixmap(rect.toRect(), QPixmap.fromImage(image))
 
     def _label_slice(self) -> np.ndarray | None:
         if self._label_volume is None:
@@ -2979,8 +3292,10 @@ class SliceCanvas(QWidget):
         rect, (scale_x, scale_y) = self._draw_geometry(image_w, image_h)
         painter.drawPixmap(rect.toRect(), self._pixmap(image))
 
-        if self._show_labels:
+        if self._show_labels and not (self._external_compare and self._external_volume is not None):
             self._draw_label_overlay(painter, rect)
+        if self._external_volume is not None:
+            self._draw_external_overlay(painter, rect)
 
         # Thin frame makes the actual image bounds clear when zoomed out.
         painter.setPen(QPen(QColor("#525b6b"), 1))
@@ -4166,6 +4481,20 @@ class MicrobleedViewer(QMainWindow):
         self._readout_timer.setInterval(120)
         self._readout_timer.timeout.connect(self._update_roi_readout)
         self._others_cache: tuple[Any, Any] | None = None
+        # case_id -> the model outputs found for it.  Filenames only; nothing
+        # is opened until a reader asks for one.
+        self.external_index: dict[str, list[ExternalResult]] = {}
+        self.external_result: ExternalResult | None = None
+        # The loaded file as it came, its kind, and the mask that comes out of
+        # it at the current threshold.  Kept apart so moving the threshold
+        # does not re-read half a gigabyte off disk.
+        self.external_data: np.ndarray | None = None
+        self.external_kind = "mask"
+        self.external_threshold = 0.5
+        self.external_mask: np.ndarray | None = None
+        self.external_blobs: list[dict[str, Any]] = []
+        self._external_3d = False
+        self._external_3d_cache: tuple[Any, Any] | None = None
         self.label_values: dict[str, int] = {}
         self.label_sources: dict[str, str | None] = {}
         # How each finding's mask was made, and under what settings, so the
@@ -4247,6 +4576,9 @@ class MicrobleedViewer(QMainWindow):
         self._update_save_buttons()
         self.set_tool(None)
         self.more_btn.setToolTip(self._dataset_tooltip())
+        # Before the queue is built: whether a case has model output decides
+        # how its row reads.
+        self._apply_developer_mode()
         self._reload_case_list()
         self._set_status("Select a case from the queue.")
 
@@ -4471,6 +4803,22 @@ class MicrobleedViewer(QMainWindow):
         self.export_action.triggered.connect(lambda _checked=False: self.export_reviews())
         self.dataset_action = menu.addAction("Dataset…")
         self.dataset_action.triggered.connect(lambda _checked=False: self.change_dataset())
+        menu.addSeparator()
+        # Developer mode is for looking at a detector's output, which is a
+        # different job from reading a case and must never be the first thing
+        # a reader sees.  Off by default, and it stays off between sessions
+        # unless it is turned on deliberately.
+        self.developer_action = menu.addAction("Developer mode")
+        self.developer_action.setCheckable(True)
+        self.developer_action.setChecked(self.settings.developer_mode)
+        self.developer_action.setToolTip(
+            "Show the External tab: segmentations produced outside this tool"
+        )
+        self.developer_action.toggled.connect(self._set_developer_mode)
+        self.external_action = menu.addAction("External segmentations…")
+        self.external_action.triggered.connect(
+            lambda _checked=False: self.configure_external_results()
+        )
         menu.addSeparator()
         self.settings_action = menu.addAction("Preferences…")
         self.settings_action.triggered.connect(lambda _checked=False: self.open_settings())
@@ -4710,6 +5058,7 @@ class MicrobleedViewer(QMainWindow):
         layout.addStretch(1)
 
         self._build_segment_tab()
+        self._build_external_tab()
 
         return card
 
@@ -4873,7 +5222,7 @@ class MicrobleedViewer(QMainWindow):
             "Whether the grower slipped down a vessel, or a stroke is one\n"
             "slice thick, is one drag rather than a scroll through the stack."
         )
-        self.lesion_3d_btn.clicked.connect(lambda _checked=False: self.open_lesion_3d())
+        self.lesion_3d_btn.clicked.connect(lambda _checked=False: self.open_own_lesion_3d())
         edit_row.addWidget(self.lesion_3d_btn, 1)
         layout.addLayout(edit_row)
         segment_save_row = QHBoxLayout()
@@ -4897,6 +5246,134 @@ class MicrobleedViewer(QMainWindow):
         )
         segment_save_row.addWidget(self.segment_next_btn, 1)
         layout.addLayout(segment_save_row)
+        layout.addStretch(1)
+
+    def _build_external_tab(self) -> None:
+        """Somebody else's segmentation of this case, for looking at.
+
+        Kept behind developer mode and to the right of Segment, in that order
+        deliberately: a reader works left to right, and a model's guess is not
+        supposed to be in the way of a first read.
+        """
+
+        layout = self._add_panel_tab(
+            "external",
+            "External",
+            "Segmentations produced outside this tool (developer mode)",
+        )
+
+        # The folder is set once and then never again, so the way to change
+        # it is a link in the sentence that says what it currently is, not a
+        # button holding a row of a panel that has none to spare.
+        self.external_note = _label("", color=COLORS["dim"], size=8)
+        self.external_note.setWordWrap(True)
+        self.external_note.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.external_note.linkActivated.connect(
+            lambda _link: self.configure_external_results()
+        )
+        layout.addWidget(self.external_note)
+
+        # A list of seven files showed three of them; a combo box shows the
+        # one that is loaded, which is the thing worth having on screen.
+        self.external_combo = QComboBox()
+        self.external_combo.setToolTip("Which result to put on the images")
+        self.external_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.external_combo.setMinimumContentsLength(10)
+        self.external_combo.currentIndexChanged.connect(self._on_external_choice_changed)
+        layout.addWidget(self.external_combo)
+
+        show_row = QHBoxLayout()
+        show_row.setSpacing(5)
+        self.external_show_cb = QCheckBox("Show")
+        self.external_show_cb.setChecked(True)
+        self.external_show_cb.setToolTip("Draw the loaded result over the images, in purple")
+        self.external_show_cb.toggled.connect(lambda _checked=False: self._apply_external_to_views())
+        show_row.addWidget(self.external_show_cb)
+        self.external_compare_cb = QCheckBox("Compare")
+        self.external_compare_cb.setToolTip(
+            "Set it against your own mask for this finding:\n"
+            "green where you agree, yellow yours alone, purple theirs alone."
+        )
+        self.external_compare_cb.toggled.connect(self._on_external_compare_toggled)
+        show_row.addWidget(self.external_compare_cb)
+        show_row.addStretch(1)
+        self.external_3d_btn = QPushButton("3D")
+        self.external_3d_btn.setObjectName("SaveButton")
+        self.external_3d_btn.setToolTip(
+            "Every detection in this result, in the head, in one window.\n"
+            "Where they sit relative to each other is what says whether a\n"
+            "model is finding lesions or following a vessel."
+        )
+        self.external_3d_btn.clicked.connect(lambda _checked=False: self.open_external_3d())
+        show_row.addWidget(self.external_3d_btn)
+        layout.addLayout(show_row)
+
+        # Only useful on a probability map, so it is only enabled for one --
+        # see external_results.classify.  A threshold control over a binary
+        # mask is a knob that does nothing, which is worse than no knob.
+        # Shown only for a probability map -- and hidden, not merely
+        # disabled, because a greyed-out row still occupies the panel and
+        # still reads as something that ought to work.
+        self.external_threshold_row = QWidget()
+        threshold_row = QHBoxLayout(self.external_threshold_row)
+        threshold_row.setContentsMargins(0, 0, 0, 0)
+        threshold_row.setSpacing(5)
+        self.external_threshold_label = _label("threshold", color=COLORS["faint"], size=8, wrap=False)
+        threshold_row.addWidget(self.external_threshold_label)
+        self.external_threshold_spin = QDoubleSpinBox()
+        self.external_threshold_spin.setRange(0.01, 0.99)
+        self.external_threshold_spin.setSingleStep(0.05)
+        self.external_threshold_spin.setDecimals(2)
+        self.external_threshold_spin.setValue(0.5)
+        self.external_threshold_spin.setKeyboardTracking(False)
+        self.external_threshold_spin.setMinimumWidth(62)
+        self.external_threshold_spin.setMaximumWidth(84)
+        self.external_threshold_spin.setToolTip(
+            "Where a probability map becomes a mask. Everything shown, counted\n"
+            "and compared below is at this value."
+        )
+        self.external_threshold_spin.valueChanged.connect(self._on_external_threshold_changed)
+        threshold_row.addWidget(self.external_threshold_spin)
+        self.external_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.external_threshold_slider.setRange(1, 99)
+        self.external_threshold_slider.setValue(50)
+        self.external_threshold_slider.setToolTip(
+            "Drag to choose a threshold, then Apply.\n"
+            "Nothing is recomputed while you drag: re-thresholding twelve\n"
+            "million voxels and re-separating the detections takes long\n"
+            "enough that a live slider would lurch behind the mouse."
+        )
+        self.external_threshold_slider.valueChanged.connect(self._on_external_slider_moved)
+        threshold_row.addWidget(self.external_threshold_slider, 1)
+        self.external_apply_btn = QPushButton("Apply")
+        self.external_apply_btn.setObjectName("SaveButton")
+        self.external_apply_btn.setToolTip("Re-threshold the result at this value  (Enter)")
+        self.external_apply_btn.setEnabled(False)
+        self.external_apply_btn.clicked.connect(
+            lambda _checked=False: self._apply_external_threshold()
+        )
+        threshold_row.addWidget(self.external_apply_btn)
+        layout.addWidget(self.external_threshold_row)
+
+        self.external_readout = _label("", color=COLORS["dim"], size=8)
+        self.external_readout.setWordWrap(True)
+        layout.addWidget(self.external_readout)
+
+        # What the model claims to have found, largest first.  Clicking one
+        # moves the views there: finding a detector's false positives means
+        # visiting each of them, and hunting for them by scrolling is how a
+        # reader stops bothering.
+        self.external_blob_list = QListWidget()
+        self.external_blob_list.setMinimumHeight(46)
+        self.external_blob_list.setMaximumHeight(90)
+        self.external_blob_list.setToolTip("Click a detection to centre the views on it")
+        self.external_blob_list.currentRowChanged.connect(self._on_external_blob_changed)
+        layout.addWidget(self.external_blob_list)
+
         layout.addStretch(1)
 
     def _build_shortcut_section(self) -> QWidget:
@@ -5181,6 +5658,13 @@ class MicrobleedViewer(QMainWindow):
             "This is the adjudication queue for the reviews in this database,\n"
             "as opposed to the notes that came with the source sheet."
         )
+        # Only useful in developer mode, and shown only there: a filter for
+        # a thing the reader cannot see is a filter that appears broken.
+        self.external_only_cb = QCheckBox("Has external segmentation")
+        self.external_only_cb.setToolTip(
+            "Show only the cases marked * — the ones a model has produced a\n"
+            "segmentation for (More ▾ → Developer mode)"
+        )
         self.filter_checkboxes = (
             self.hide_missing_cb,
             self.complete_only_cb,
@@ -5189,7 +5673,9 @@ class MicrobleedViewer(QMainWindow):
             self.source_unverified_cb,
             self.adjudication_cb,
             self.disagreement_cb,
+            self.external_only_cb,
         )
+        self._filter_actions: dict[QCheckBox, QWidgetAction] = {}
         for checkbox in self.filter_checkboxes:
             checkbox.toggled.connect(self._apply_case_filters)
             checkbox.toggled.connect(lambda _checked: self._update_filter_badge())
@@ -5199,6 +5685,10 @@ class MicrobleedViewer(QMainWindow):
             checkbox.setContentsMargins(8, 3, 8, 3)
             holder.setDefaultWidget(checkbox)
             self.filter_menu.addAction(holder)
+            self._filter_actions[checkbox] = holder
+        self._filter_actions[self.external_only_cb].setVisible(
+            self.settings.developer_mode
+        )
         self.filter_btn = QPushButton("Filters")
         self.filter_btn.setObjectName("IconButton")
         self.filter_btn.setToolTip("Narrow the case queue")
@@ -5327,6 +5817,7 @@ class MicrobleedViewer(QMainWindow):
             "tool_brush": lambda: self.set_tool(None if self.active_tool == "brush" else "brush"),
             "tool_eraser": lambda: self.set_tool(None if self.active_tool == "eraser" else "eraser"),
             "toggle_roi_overlay": lambda: self.show_roi_cb.toggle(),
+            "toggle_external_overlay": self._toggle_external_overlay_key,
             "brush_smaller": lambda: self.step_brush_radius(-self.brush_spin.singleStep()),
             "brush_larger": lambda: self.step_brush_radius(self.brush_spin.singleStep()),
             "undo_roi": self.undo_roi,
@@ -5465,6 +5956,23 @@ class MicrobleedViewer(QMainWindow):
         self._refresh_modality_tooltips()
 
     # ------------------------------------------------------------ case list --
+    def refresh_external_index(self) -> None:
+        """Find which cases have model output, without opening any of it."""
+
+        if not self.settings.developer_mode or not self.settings.external_root:
+            self.external_index = {}
+        else:
+            try:
+                self.external_index = external_results.discover(
+                    self.settings.external_root, self.settings.external_pattern
+                )
+            except OSError as exc:
+                self.external_index = {}
+                self._set_status(f"Could not read the results folder: {exc}", COLORS["warn"])
+        if hasattr(self, "case_list"):
+            self._apply_case_filters()
+        self._refresh_external_panel()
+
     def _reload_case_list(self) -> None:
         self.all_cases = list_cases(self.db_path, self.reader_id, self.review_round)
         self._apply_case_filters()
@@ -5489,6 +5997,12 @@ class MicrobleedViewer(QMainWindow):
                 continue
             if getattr(self, "disagreement_cb", None) and self.disagreement_cb.isChecked() and item["disagreement_count"] <= 0:
                 continue
+            if (
+                getattr(self, "external_only_cb", None)
+                and self.external_only_cb.isChecked()
+                and str(item["case_id"]) not in self.external_index
+            ):
+                continue
             filtered.append(item)
         self.visible_cases = filtered
         if hasattr(self, "case_list"):
@@ -5505,7 +6019,13 @@ class MicrobleedViewer(QMainWindow):
                 # the case/modality is loaded. Filters still use inventory
                 # state behind the scenes.
                 progress = f"{reviewed}/{total} reviewed" if total else "no findings"
-                text = f"{item['case_id']}      {_human_count(total, 'finding')}  ·  {progress}"
+                # Model output exists for a handful of cases out of hundreds,
+                # so without a mark the only way to find them is to open each.
+                # On the identifier rather than at the end of the row: that is
+                # where the eye is when it is looking for a case.
+                outputs = self.external_index.get(str(item["case_id"])) or []
+                marked = f"{item['case_id']}*" if outputs else str(item["case_id"])
+                text = f"{marked}      {_human_count(total, 'finding')}  ·  {progress}"
                 list_item = QListWidgetItem(text)
                 list_item.setData(Qt.ItemDataRole.UserRole, item["case_id"])
                 if total and reviewed >= total:
@@ -5518,6 +6038,13 @@ class MicrobleedViewer(QMainWindow):
                     f"Source-unverified findings: {item['source_unverified_count']} · "
                     f"adjudication notes: {item['adjudication_count']} · "
                     f"reader disagreements: {item['disagreement_count']}"
+                    + (
+                        chr(10)
+                        + f"* {len(outputs)} external segmentation(s): "
+                        + ", ".join(entry.label for entry in outputs[:6])
+                        if outputs
+                        else ""
+                    )
                 )
                 self.case_list.addItem(list_item)
                 if item["case_id"] == previous_id:
@@ -5634,6 +6161,7 @@ class MicrobleedViewer(QMainWindow):
         # interaction remains native and continuous after this short load
         # step; correctness and process stability are more important here.
         self._load_case_sync(paths, generation)
+        self._refresh_external_panel()
         self._restore_slice_positions_if_resumed(case_id)
         self._schedule_session_save()
         self._schedule_prefetch()
@@ -5664,14 +6192,65 @@ class MicrobleedViewer(QMainWindow):
             except (TypeError, ValueError):
                 continue
 
+    def _fetch_cloud_files(
+        self, files: list[tuple[str, str]], progress: "LoadProgress"
+    ) -> None:
+        """Bring any cloud-only file down before the loader touches it.
+
+        ``files`` is (path, what to call it).  Local files cost one stat and
+        are skipped; the rest are read through on a worker thread so the
+        dialog can animate while Windows fetches them.
+        """
+
+        pending = [(path, label) for path, label in files if is_cloud_only(path)]
+        if not pending:
+            return
+        for index, (path, label) in enumerate(pending, start=1):
+            done: list[bool] = []
+
+            def pull(target: str = path) -> None:
+                try:
+                    fetch_local_copy(target)
+                except OSError:
+                    # Let the loader hit the same error and report it in the
+                    # words it already has for a file it cannot read.
+                    pass
+                finally:
+                    done.append(True)
+
+            worker = threading.Thread(target=pull, daemon=True)
+            worker.start()
+            size = ""
+            try:
+                size = f" · {Path(path).stat().st_size / 1e6:.0f} MB"
+            except OSError:
+                pass
+            progress.wait_for(
+                lambda: bool(done),
+                f"Downloading {label} from the cloud{size}…"
+                + (f"  ({index} of {len(pending)})" if len(pending) > 1 else ""),
+            )
+
     def _load_case_sync(self, paths: dict[str, str | None], generation: int) -> None:
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self._loading = True
+        axcodes = self.settings.axcodes
+        wanted = [
+            (paths[modality], MODALITY_SHORT_LABELS[modality])
+            for modality in MODALITY_ORDER
+            if paths.get(modality)
+            and self.volume_cache.get(paths[modality], axcodes) is None
+        ]
+        progress = LoadProgress(
+            self, f"Opening {self.current_case_id}…", steps=max(len(wanted), 1)
+        )
         try:
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            self._fetch_cloud_files(wanted, progress)
+            progress.measured(max(len(wanted), 1))
             volumes: dict[str, Volume | None] = {}
             errors: dict[str, str] = {}
-            axcodes = self.settings.axcodes
+            done = 0
             for modality in MODALITY_ORDER:
                 path = paths.get(modality)
                 if not path:
@@ -5681,6 +6260,10 @@ class MicrobleedViewer(QMainWindow):
                 if cached is not None:
                     volumes[modality] = cached
                     continue
+                progress.step(
+                    f"Reading {MODALITY_LABELS[modality]}…  ({done + 1} of {len(wanted)})",
+                    done,
+                )
                 try:
                     volume = load_volume(path, axcodes)
                 except Exception as exc:
@@ -5689,6 +6272,7 @@ class MicrobleedViewer(QMainWindow):
                 else:
                     volumes[modality] = volume
                     self.volume_cache.put(path, axcodes, volume)
+                done += 1
             if generation != self._load_generation or self._closing:
                 return
             self.volumes = volumes
@@ -5723,6 +6307,7 @@ class MicrobleedViewer(QMainWindow):
                 )
         finally:
             self._loading = False
+            progress.close()
             QApplication.restoreOverrideCursor()
 
     def _resolve_case_modality(self) -> str | None:
@@ -6883,6 +7468,426 @@ class MicrobleedViewer(QMainWindow):
                 COLORS["success"],
             )
 
+    # ------------------------------------------------ external segmentations --
+    def _set_developer_mode(self, enabled: bool) -> None:
+        self.settings.set_developer_mode(enabled)
+        self._apply_developer_mode()
+        if enabled and not self.settings.external_root:
+            self.configure_external_results()
+
+    def _apply_developer_mode(self) -> None:
+        """Show or hide the External tab, and forget what it was showing."""
+
+        enabled = self.settings.developer_mode
+        self._update_external_tab_visibility()
+        if hasattr(self, "developer_action"):
+            self.developer_action.setChecked(enabled)
+        if not enabled:
+            self.clear_external_result()
+            # A filter nobody can see would go on filtering.
+            self.external_only_cb.setChecked(False)
+        self._filter_actions[self.external_only_cb].setVisible(enabled)
+        self.refresh_external_index()
+
+    def _update_external_tab_visibility(self) -> None:
+        """The tab exists for the cases that have something to put in it.
+
+        Developer mode is a mode; an empty tab on every other case is just a
+        thing to click on and find nothing behind.
+        """
+
+        if "external" not in self._panel_tab_keys:
+            return
+        index = self._panel_tab_keys.index("external")
+        wanted = bool(self.settings.developer_mode) and bool(self._external_entries())
+        if self.panel_tabs.isTabVisible(index) == wanted:
+            return
+        self.panel_tabs.setTabVisible(index, wanted)
+
+    def configure_external_results(self) -> None:
+        dialog = ExternalResultsDialog(
+            self, self.settings.external_root, self.settings.external_pattern
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        root, pattern = dialog.result()
+        self.settings.set_external_results(root, pattern)
+        if root and not self.settings.developer_mode:
+            self.settings.set_developer_mode(True)
+            self._apply_developer_mode()
+            return
+        self.refresh_external_index()
+        found = len(self.external_index)
+        self._set_status(
+            f"External segmentations: {_human_count(found, 'case')} found."
+            if found
+            else "No external segmentations found under that folder.",
+            COLORS["accent"] if found else COLORS["warn"],
+        )
+
+    def _external_entries(self) -> list[ExternalResult]:
+        if not self.settings.developer_mode or self.current_case_id is None:
+            return []
+        return list(self.external_index.get(str(self.current_case_id), []))
+
+    def _refresh_external_panel(self) -> None:
+        """Rebuild the External tab for whatever case is open."""
+
+        if not hasattr(self, "external_combo"):
+            return
+        entries = self._external_entries()
+        if self.external_result is not None and self.external_result not in entries:
+            # A different case, or the folder changed underneath us.
+            self.clear_external_result(refresh=False)
+
+        self.external_combo.blockSignals(True)
+        self.external_combo.clear()
+        # Nothing, first: it is both the state the tab opens in and the way
+        # back out of a result, which is what an Unload button would have been.
+        self.external_combo.addItem("(nothing loaded)")
+        for entry in entries:
+            self.external_combo.addItem(entry.label)
+            self.external_combo.setItemData(
+                self.external_combo.count() - 1, str(entry.path), Qt.ItemDataRole.ToolTipRole
+            )
+        self.external_combo.setCurrentIndex(
+            entries.index(self.external_result) + 1
+            if self.external_result is not None and self.external_result in entries
+            else 0
+        )
+        self.external_combo.blockSignals(False)
+
+        if not self.settings.developer_mode:
+            note = "Developer mode is off."
+        elif not self.settings.external_root:
+            note = "No results folder chosen yet."
+        elif self.current_case_id is None:
+            note = "Open a case."
+        elif entries:
+            note = (
+                f"{_human_count(len(entries), 'file')} for {self.current_case_id}, "
+                f"read from {self.settings.external_pattern}"
+            )
+        else:
+            note = (
+                f"Nothing for {self.current_case_id} under "
+                f"{Path(self.settings.external_root).name}."
+            )
+        link = "Choose a folder" if not self.settings.external_root else "Change"
+        self.external_note.setText(
+            f'{note}  <a href="#folder" style="color:{COLORS["accent"]};">{link}…</a>'
+        )
+        self._update_external_tab_visibility()
+        loaded = self.external_mask is not None
+        for widget in (self.external_show_cb, self.external_compare_cb):
+            widget.setEnabled(loaded)
+        self.external_3d_btn.setEnabled(loaded)
+        self.external_combo.setEnabled(bool(entries))
+        self.external_threshold_row.setVisible(loaded and self.external_kind == "probability")
+        self._update_external_readout()
+
+    def _on_external_choice_changed(self, index: int) -> None:
+        entries = self._external_entries()
+        if index <= 0:
+            self.clear_external_result()
+            return
+        if index - 1 < len(entries):
+            self.load_external_result(entries[index - 1])
+
+    def load_external_result(self, entry: ExternalResult) -> None:
+        """Read one file, decide what it is, and put it on the images.
+
+        Refused rather than resampled when the grid differs: a mask shifted
+        into place without saying so is how a lesion moves a millimetre and
+        nobody notices.
+        """
+
+        reference = self._label_reference()
+        if reference is None:
+            self._set_status("Load a case before opening an external segmentation.", COLORS["warn"])
+            return
+        progress = LoadProgress(self, f"Opening {entry.label}…", steps=1)
+        try:
+            self._fetch_cloud_files([(str(entry.path), entry.label)], progress)
+            progress.measured(1)
+            progress.step(f"Reading {entry.label}…", 0)
+            volume = load_volume(entry.path, self.settings.axcodes)
+        except Exception as exc:
+            self._set_status(f"Could not read {entry.label}: {exc}", COLORS["danger"])
+            return
+        finally:
+            progress.close()
+        if not external_results.geometry_matches(volume, reference):
+            self.clear_external_result()
+            self._set_status(
+                f"{entry.label} is not on this case's voxel grid "
+                f"({'×'.join(str(int(n)) for n in volume.shape[:3])} against "
+                f"{'×'.join(str(int(n)) for n in reference.shape[:3])}). "
+                "It was not loaded: overlaying it would put the mask in the wrong place.",
+                COLORS["danger"],
+            )
+            return
+        data = np.asarray(volume.data, dtype=np.float32)
+        self.external_result = entry
+        self.external_data = data
+        self.external_kind = external_results.classify(data)
+        if self.external_kind == "probability":
+            # A probability map arrives with no threshold attached, so the
+            # only honest default is the middle, said out loud in the readout.
+            self.external_threshold = 0.5
+            self._set_external_threshold(0.5)
+            self.external_apply_btn.setEnabled(False)
+        self._rebuild_external_mask()
+        self._refresh_external_panel()
+        self._log_event(
+            "external_segmentation_loaded",
+            session_id=self.session_id,
+            reader_id=self.reader_id,
+            review_round=self.review_round,
+            case_id=self.current_case_id,
+            details={"file": str(entry.path), "kind": self.external_kind},
+        )
+
+    def _set_external_threshold(self, value: float) -> None:
+        for widget, scale in (
+            (self.external_threshold_spin, 1.0),
+            (self.external_threshold_slider, 100.0),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(type(widget.value())(value * scale))
+            widget.blockSignals(False)
+
+    def _on_external_threshold_changed(self, value: float) -> None:
+        self.external_threshold_slider.blockSignals(True)
+        self.external_threshold_slider.setValue(int(round(float(value) * 100)))
+        self.external_threshold_slider.blockSignals(False)
+        self._note_threshold_pending()
+
+    def _on_external_slider_moved(self, value: int) -> None:
+        self.external_threshold_spin.blockSignals(True)
+        self.external_threshold_spin.setValue(float(value) / 100.0)
+        self.external_threshold_spin.blockSignals(False)
+        self._note_threshold_pending()
+
+    def _note_threshold_pending(self) -> None:
+        """The number moved; the mask has not.
+
+        Applying costs a pass over twelve million voxels, a flood fill over
+        everything above the line, a redraw of three views and -- with the
+        3D window open -- a surface per detection.  On a slider that is once
+        per mouse pixel, so the work waits for Apply and the readout says so
+        rather than leaving the screen quietly disagreeing with the control.
+        """
+
+        pending = abs(float(self.external_threshold_spin.value()) - self.external_threshold) > 1e-9
+        self.external_apply_btn.setEnabled(pending)
+        self._update_external_readout()
+
+    def _apply_external_threshold(self) -> None:
+        self.external_threshold = float(self.external_threshold_spin.value())
+        self.external_apply_btn.setEnabled(False)
+        self._rebuild_external_mask()
+
+    def _rebuild_external_mask(self) -> None:
+        """Apply the threshold, then say what is in the result."""
+
+        if self.external_data is None:
+            self.external_mask = None
+            self.external_blobs = []
+        else:
+            if self.external_kind == "probability":
+                self.external_mask = self.external_data >= self.external_threshold
+            else:
+                self.external_mask = self.external_data > 0.5
+            count = int(np.count_nonzero(self.external_mask))
+            # Separating blobs is a Python flood fill, about five microseconds
+            # a voxel.  A detector's output is tens of voxels; a probability
+            # map at a low threshold is millions, and the list would be
+            # useless as well as slow, so it says so instead of hanging.
+            self.external_blobs = (
+                external_results.components(self.external_mask)
+                if 0 < count <= EXTERNAL_BLOB_VOXEL_LIMIT
+                else []
+            )
+        self._external_3d_cache = None
+        self._apply_external_to_views()
+        self._populate_external_blobs()
+        self._update_external_readout()
+        self._refresh_lesion_3d()
+
+    def _on_external_compare_toggled(self, enabled: bool) -> None:
+        """Comparing means both are on screen.
+
+        Turning it on with the segmentation overlay hidden would show the
+        model's mask and the agreement colour but not the reader's own, which
+        looks exactly like a model that found something the reader missed.
+        """
+
+        if enabled:
+            # Both of them, for the same reason: comparing against something
+            # that is switched off shows one mask and reads as the other one
+            # having found nothing there.
+            if not self.show_roi_cb.isChecked():
+                self.show_roi_cb.setChecked(True)
+            if not self.external_show_cb.isChecked():
+                self.external_show_cb.setChecked(True)
+        self._apply_external_to_views()
+
+    def _toggle_external_overlay_key(self) -> None:
+        if self.external_show_cb.isEnabled():
+            self.external_show_cb.toggle()
+
+    def _apply_external_to_views(self) -> None:
+        visible = self.external_mask is not None and self.external_show_cb.isChecked()
+        compare = visible and self.external_compare_cb.isChecked()
+        for panel in self.view_panels.values():
+            panel.canvas.set_external_overlay(
+                self.external_mask if visible else None, compare=compare
+            )
+        if hasattr(self, "external_readout"):
+            self._update_external_readout()
+
+    def _populate_external_blobs(self) -> None:
+        self.external_blob_list.blockSignals(True)
+        self.external_blob_list.clear()
+        voxel_mm3 = self._external_voxel_mm3()
+        for index, blob in enumerate(self.external_blobs[:EXTERNAL_BLOB_ROW_LIMIT], start=1):
+            voxels = int(blob["voxels"])
+            item = QListWidgetItem(
+                f"{index}.  {voxels * voxel_mm3:.1f} mm³  ·  {_human_count(voxels, 'voxel')}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, index - 1)
+            self.external_blob_list.addItem(item)
+        self.external_blob_list.blockSignals(False)
+
+    def _external_voxel_mm3(self) -> float:
+        reference = self._label_reference()
+        if reference is None:
+            return 1.0
+        return float(np.prod(np.asarray(reference.voxel_sizes[:3], dtype=np.float64)))
+
+    def _on_external_blob_changed(self, row: int) -> None:
+        """Centre the three views on a detection."""
+
+        if not (0 <= row < len(self.external_blobs)):
+            return
+        reference = self._label_reference()
+        if reference is None:
+            return
+        centre = np.asarray(self.external_blobs[row]["centre"], dtype=np.float64)
+        try:
+            ras = tuple(float(value) for value in voxel_to_ras(reference.affine, centre))
+        except Exception:
+            return
+        # Navigation only: the finding under review and its recorded
+        # coordinate are untouched, exactly as when clicking on an image.
+        self.target_ras = ras
+        self._set_coordinate_spins(ras)
+        self._apply_target_to_views(recenter=True)
+        self._set_status(
+            f"Detection {row + 1} of {self.external_result.label if self.external_result else 'result'}"
+            f" · RAS ({ras[0]:.2f}, {ras[1]:.2f}, {ras[2]:.2f})",
+            COLORS["accent"],
+        )
+
+    def _update_external_readout(self) -> None:
+        if not hasattr(self, "external_readout"):
+            return
+        if self.external_mask is None or self.external_result is None:
+            self.external_readout.setText("No result loaded.")
+            return
+        voxels = int(np.count_nonzero(self.external_mask))
+        voxel_mm3 = self._external_voxel_mm3()
+        kind = (
+            f"probability map at ≥ {self.external_threshold:.2f}"
+            if self.external_kind == "probability"
+            else "binary mask"
+        )
+        lines = [f"{self.external_result.label} · {kind}"]
+        if self.external_apply_btn.isEnabled():
+            lines.append(
+                f"Showing ≥ {self.external_threshold:.2f} · press Apply for "
+                f"≥ {float(self.external_threshold_spin.value()):.2f}"
+            )
+        if self.external_blobs:
+            lines.append(
+                f"{_human_count(len(self.external_blobs), 'detection')} · "
+                f"{voxels * voxel_mm3:.1f} mm³ in total"
+            )
+        elif voxels > EXTERNAL_BLOB_VOXEL_LIMIT:
+            lines.append(
+                f"{voxels:,} voxels above this threshold — too many to separate into "
+                "detections. Raise the threshold."
+            )
+        elif voxels:
+            lines.append(f"{_human_count(voxels, 'voxel')} · {voxels * voxel_mm3:.1f} mm³")
+        else:
+            lines.append("nothing above this threshold")
+
+        if self.external_compare_cb.isChecked():
+            lines.append(self._external_comparison_line())
+        self.external_readout.setText(chr(10).join(lines))
+
+    def _external_comparison_line(self) -> str:
+        """How the loaded result stands against this reader's own outlining.
+
+        Against every mask of the case, and the count of findings behind that
+        number is part of the sentence: a dice of 0.0 means something quite
+        different when the reader has segmented one finding out of nine.
+        """
+
+        if self.label_volume is None or self.external_mask is None:
+            return "Nothing of yours to compare with on this case."
+        mine = self.label_volume > 0
+        # Counted off the volume being scored, not off what has been saved:
+        # a mask painted a minute ago is in the dice whether or not it has
+        # reached the database yet, and the sentence has to describe the
+        # number that was actually compared.
+        segmented = int(np.count_nonzero(np.unique(self.label_volume)))
+        if not mine.any():
+            return f"You have not segmented any of the {len(self.targets)} findings here."
+        scores = external_results.compare(mine, self.external_mask, self._external_voxel_mm3())
+        return (
+            f"Dice {scores['dice']:.3f} against your {_human_count(segmented, 'mask')} "
+            f"({len(self.targets)} findings) · both {scores['both_voxels']} · "
+            f"yours only {scores['only_ours_voxels']} · theirs only {scores['only_theirs_voxels']}"
+        )
+
+    def clear_external_result(self, *, refresh: bool = True) -> None:
+        self.external_result = None
+        self.external_data = None
+        self.external_mask = None
+        self.external_blobs = []
+        self.external_kind = "mask"
+        self._external_3d = False
+        self._external_3d_cache = None
+        if hasattr(self, "external_blob_list"):
+            self.external_blob_list.blockSignals(True)
+            self.external_blob_list.clear()
+            self.external_blob_list.blockSignals(False)
+            self.external_combo.blockSignals(True)
+            self.external_combo.setCurrentIndex(0)
+            self.external_combo.blockSignals(False)
+        for panel in self.view_panels.values():
+            panel.canvas.set_external_overlay(None)
+        if refresh:
+            self._refresh_external_panel()
+            self._refresh_lesion_3d()
+
+    def open_external_3d(self) -> None:
+        """The loaded result in the head, in the same window as our own masks."""
+
+        if self.external_mask is None:
+            return
+        self._external_3d = True
+        self.open_lesion_3d()
+
+    def open_own_lesion_3d(self) -> None:
+        """The Segment tab's button: this reader's mask, not a model's."""
+
+        self._external_3d = False
+        self.open_lesion_3d()
+
     def open_lesion_3d(self) -> None:
         """Open the mask inspector, or bring it back to the front."""
 
@@ -6906,6 +7911,9 @@ class MicrobleedViewer(QMainWindow):
 
         dialog = getattr(self, "_lesion_dialog", None)
         if dialog is None or not dialog.isVisible():
+            return
+        if self._external_3d:
+            self._refresh_external_3d(dialog)
             return
         target = self.selected_target
         mask = self._selected_label_mask()
@@ -6995,6 +8003,157 @@ class MicrobleedViewer(QMainWindow):
             f"{int(shape['voxel_count'])} voxels  ·  {own_faces} faces\n"
             f"Bounding box {extent[0]:.1f} × {extent[1]:.1f} × {extent[2]:.1f} mm "
             f"(L-R × P-A × I-S)" + where,
+            quads,
+            normals,
+            radius_mm=radius,
+            tints=tints,
+        )
+
+    def _refresh_external_3d(self, dialog) -> None:
+        """Every detection in the loaded result, in the head, at once.
+
+        The same window as a reader's own mask and the same controls, because
+        the judgement being made is the same one -- is this thing a lesion,
+        and is it where a lesion goes.  What changes is the colour: purple for
+        the model, yellow for this reader, exactly as on the slices.
+        """
+
+        reference = self._label_reference()
+        if self.external_mask is None or reference is None or not self.external_mask.any():
+            dialog.canvas.set_context(None, None, (1.0, 1.0), (0.0, 1.0), np.zeros(3))
+            dialog.show_lesion(
+                self.external_result.label if self.external_result else "No result",
+                "Nothing above this threshold.",
+                np.zeros((0, 4, 3)),
+                np.zeros((0, 3)),
+            )
+            return
+
+        available = [key for key in MODALITY_BUTTON_ORDER if self.volumes.get(key) is not None]
+        dialog.offer_brain_sources(
+            available, MODALITY_LABELS, self._label_reference_modality() or ""
+        )
+        brain = self.volumes.get(dialog.brain_modality) or reference
+        in_brain = dialog.wants_brain and self._brain_context(brain) is not None
+        placement = self._placement_centre(reference, brain)
+        centre = placement if in_brain else None
+
+        # Surfacing tens of blobs costs about as much as one large mask, but
+        # it runs from the readout -- which fires on every brush stroke -- so
+        # it is held until something it depends on actually moves.
+        key = (
+            self.current_case_id,
+            str(self.external_result.path) if self.external_result else "",
+            round(self.external_threshold, 4),
+            bool(dialog.wants_smooth),
+            bool(in_brain),
+            self.external_compare_cb.isChecked(),
+            tuple(np.round(placement, 3)),
+        )
+        cached = self._external_3d_cache
+        if cached is not None and cached[0] == key:
+            quads, normals, tints, summary = cached[1]
+        else:
+            pieces: list[np.ndarray] = []
+            piece_normals: list[np.ndarray] = []
+            piece_tints: list[np.ndarray] = []
+            theirs = QColor(COLORS["external"])
+            ours = QColor(COLORS["roi"])
+            spacing = np.asarray(reference.voxel_sizes[:3], dtype=np.float64)
+
+            def add(mask: np.ndarray, colour: QColor, offset: np.ndarray | None = None) -> None:
+                if offset is not None:
+                    crop, low = mask, np.asarray(offset, dtype=int)
+                else:
+                    coords = np.argwhere(mask)
+                    if not len(coords):
+                        return
+                    low = coords.min(axis=0)
+                    crop = mask[
+                        low[0]:coords[:, 0].max() + 1,
+                        low[1]:coords[:, 1].max() + 1,
+                        low[2]:coords[:, 2].max() + 1,
+                    ]
+                # The crop moved the origin, so the centre the lesion is
+                # measured from has to move with it.
+                piece, normals_of = lesion_surface(
+                    crop,
+                    reference.voxel_sizes,
+                    centre=None if centre is None else centre - low * spacing,
+                    smooth=LESION_SMOOTH_PASSES if dialog.wants_smooth else 0,
+                )
+                if not len(piece):
+                    return
+                pieces.append(piece)
+                piece_normals.append(normals_of)
+                piece_tints.append(
+                    np.repeat(
+                        np.array([[colour.red(), colour.green(), colour.blue()]], dtype=np.float64),
+                        len(piece),
+                        axis=0,
+                    )
+                )
+
+            # Blob by blob rather than in one pass: separate detections have
+            # to stay separate surfaces, or two lesions a centimetre apart are
+            # drawn as one object with a bridge between them.
+            drawn = 0
+            for blob in self.external_blobs[:EXTERNAL_3D_BLOB_LIMIT]:
+                coords = np.asarray(blob["coords"], dtype=int)
+                low = coords.min(axis=0)
+                local = np.zeros(coords.max(axis=0) - low + 1, dtype=bool)
+                local[tuple((coords - low).T)] = True
+                add(local, theirs, offset=low)
+                drawn += 1
+            if not self.external_blobs:
+                add(self.external_mask, theirs)
+                drawn = 1
+            mine_count = 0
+            if self.external_compare_cb.isChecked() and self.label_volume is not None:
+                for value in np.unique(self.label_volume):
+                    if int(value) == 0:
+                        continue
+                    add(self.label_volume == int(value), ours)
+                    mine_count += 1
+
+            quads = np.concatenate(pieces) if pieces else np.zeros((0, 4, 3))
+            normals = np.concatenate(piece_normals) if piece_normals else np.zeros((0, 3))
+            tints = np.concatenate(piece_tints) if piece_tints else np.zeros((0, 3))
+            summary = (drawn, mine_count)
+            self._external_3d_cache = (key, (quads, normals, tints, summary))
+
+        radius = None
+        if in_brain:
+            fine, coarse, mm_fine, mm_coarse, window = self._brain_context(brain)
+            dialog.canvas.set_context(fine, coarse, (mm_fine, mm_coarse), window, np.zeros(3))
+            brain_spacing = np.asarray(brain.voxel_sizes[:3], dtype=np.float64)
+            radius = float(max(np.asarray(brain.shape[:3]) * brain_spacing) / 2.0)
+        else:
+            dialog.canvas.set_context(None, None, (1.0, 1.0), (0.0, 1.0), np.zeros(3))
+
+        drawn, mine_count = summary
+        voxels = int(np.count_nonzero(self.external_mask))
+        kind = (
+            f"at ≥ {self.external_threshold:.2f}"
+            if self.external_kind == "probability"
+            else "binary mask"
+        )
+        detail = (
+            f"{_human_count(drawn, 'detection')} {kind}  ·  "
+            f"{voxels * self._external_voxel_mm3():.1f} mm³  ·  {len(quads)} faces"
+        )
+        if mine_count:
+            detail += f"{chr(10)}{_human_count(mine_count, 'mask')} of yours, in yellow"
+        elif self.external_compare_cb.isChecked():
+            detail += f"{chr(10)}You have not segmented anything on this case."
+        if len(self.external_blobs) > EXTERNAL_3D_BLOB_LIMIT:
+            detail += (
+                f"{chr(10)}Showing the largest {EXTERNAL_3D_BLOB_LIMIT} of "
+                f"{len(self.external_blobs)}."
+            )
+        dialog.show_lesion(
+            f"{self.external_result.label if self.external_result else 'result'}  ·  external",
+            detail,
             quads,
             normals,
             radius_mm=radius,

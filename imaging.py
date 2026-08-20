@@ -102,6 +102,58 @@ class Volume:
     source_codes: tuple[int, int] | None = None
 
 
+# Windows marks a file whose contents are not on this disk yet.  A study on
+# OneDrive is mostly such files -- 124 of the 500 sequence files here on the
+# machine this was written on -- and the first read of one blocks until the
+# whole thing has been downloaded.
+FILE_ATTRIBUTE_OFFLINE = 0x00001000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+CLOUD_ATTRIBUTES = (
+    FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+
+def is_cloud_only(path: str | Path) -> bool:
+    """True when reading this file means downloading it first.
+
+    Cheap: one stat, no open.  Everything that wants to warn a reader before
+    a several-second stall has to ask this about every file first, including
+    the ones that turn out to be local.
+    """
+
+    try:
+        attributes = getattr(os.stat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & CLOUD_ATTRIBUTES)
+
+
+def fetch_local_copy(path: str | Path, chunk_bytes: int = 4 * 1024 * 1024) -> int:
+    """Pull a cloud file onto the disk, and report how many bytes that was.
+
+    Reading and discarding is the only way to ask Windows for the contents;
+    there is no "download this" call that does not go through a read.  Done
+    before the loader so the several seconds of waiting happen somewhere a
+    progress dialog can be on screen -- measured at 2.05 s for a 28.6 MB
+    sequence here, and the download is *not* incremental: the first 4 MB read
+    took 2.04 of those seconds and the rest returned instantly.  So this
+    reports whole files, never a percentage within one, because a percentage
+    within one would be a lie.
+    """
+
+    total = 0
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk_bytes)
+            if not block:
+                break
+            total += len(block)
+    return total
+
+
 def load_volume(path: str | Path, axcodes: Iterable[str] | None = None) -> Volume:
     """Load a NIfTI volume in the viewer's display space.
 

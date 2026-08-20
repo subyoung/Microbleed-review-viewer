@@ -182,6 +182,40 @@ agreement column, a long form with every review, one row per segmented finding
 with its volume and centroid, and a pairwise agreement table (Dice, volume
 ratio, centroid distance) for the findings two readers both outlined.
 
+## Looking at a model's output
+
+If you train a detector on this data, **More ▾ → Developer mode** adds an
+**External** tab that reads segmentations produced outside the viewer. Point it
+at a folder holding one subfolder per case — named with the same case
+identifiers — and say where inside a case folder the files are (`.` for the
+folder itself, `./models` for a subfolder):
+
+```
+results/
+  CASE_0001/
+    models/nnunet_prediction.nii.gz
+    models/ensemble_probability.nii.gz
+  CASE_0002/
+    models/...
+```
+
+Cases that have output are marked `◆ N` in the queue. A binary mask and a
+probability map are told apart from the data rather than the filename, and a
+probability map gets a threshold that everything below it follows: the overlay,
+the detection count, the volume, the comparison, the 3D view. Detections are
+separated by 6-connectivity and listed largest first; clicking one centres the
+three views on it. **Compare** puts the result against your own outlining in
+three colours — green where you agree, yellow yours alone, purple theirs alone
+— with Dice and the three counts behind it.
+
+The folder is only ever read. A file that is not on the case's voxel grid is
+refused rather than resampled, with both shapes named, because a mask quietly
+resampled into place is how a lesion moves a millimetre and nobody notices.
+
+It is off by default and hidden when off: a reader judging findings should not
+be shown a detector's guesses, because seeing them first is how a reader stops
+reading and starts agreeing.
+
 ## Data safety
 
 - The source workbook is copied to a local snapshot at launch and never
