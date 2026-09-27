@@ -410,6 +410,238 @@ class DesktopViewerTests(unittest.TestCase):
         finally:
             progress.close()
 
+    # ---------------------------------------------------- semi-automatic --
+    def _turn_on_semi_automatic(self) -> None:
+        self.settings.update(
+            auto_zoom=self.settings.auto_zoom,
+            lesion_fov_mm=self.settings.lesion_fov_mm,
+            save_advances=True,
+            default_modality=self.settings.default_modality,
+            semi_automatic=True,
+        )
+        self.window._apply_semi_automatic()
+        self.window.propose_mask(because="arrived")
+
+    def _first_unjudged(self) -> int:
+        for index, target in enumerate(self.window.targets):
+            if target.get("reader_verify") is None:
+                return index
+        return 0
+
+    def test_the_two_panels_become_one_and_go_back(self) -> None:
+        segment = self.window._panel_tab_keys.index("segment")
+        review_body = self.window.panel_pages["review"].widget()
+        self.assertTrue(self.window.panel_tabs.isTabVisible(segment))
+
+        self._turn_on_semi_automatic()
+        self.assertFalse(self.window.panel_tabs.isTabVisible(segment))
+        self.assertIs(self.window.segment_panel.parent(), review_body)
+        self.assertEqual(self.window.panel_tabs.tabText(0), "Read")
+        # What the mode makes redundant is gone, not merely greyed.
+        self.assertTrue(self.window.auto_row_widget.isHidden())
+        self.assertTrue(self.window.segment_save_row_widget.isHidden())
+        self.assertTrue(self.window.position_row_widget.isHidden())
+        self.assertTrue(self.window.brush_spin.isHidden())
+
+        self.settings.update(
+            auto_zoom=self.settings.auto_zoom,
+            lesion_fov_mm=self.settings.lesion_fov_mm,
+            save_advances=True,
+            default_modality=self.settings.default_modality,
+            semi_automatic=False,
+        )
+        self.window._apply_semi_automatic()
+        self.assertTrue(self.window.panel_tabs.isTabVisible(segment))
+        self.assertIsNot(self.window.segment_panel.parent(), review_body)
+        self.assertEqual(self.window.panel_tabs.tabText(0), "Review")
+        self.assertFalse(self.window.auto_row_widget.isHidden())
+        self.assertFalse(self.window.brush_spin.isHidden())
+
+    def test_the_merged_panel_still_needs_no_scrolling(self) -> None:
+        """The mode that removes work must not open scrolled.
+
+        Merged as they stood the two wanted 330px of the 282px this panel has
+        at the window's minimum size, which is why semi-automatic mode puts
+        the brush row and the position row away.
+        """
+
+        self._turn_on_semi_automatic()
+        minimum = self.window.minimumSize()
+        self.window.resize(minimum.width(), minimum.height())
+        self._wait_for(lambda: False, timeout_ms=250)
+        self.window.show_panel_tab("review")
+        self._wait_for(lambda: False, timeout_ms=100)
+        scroll = self.window.panel_pages["review"]
+        self.assertLessEqual(
+            scroll.widget().sizeHint().height(),
+            scroll.viewport().height(),
+            f"the merged panel wants {scroll.widget().sizeHint().height()}px of "
+            f"{scroll.viewport().height()}px",
+        )
+
+    def test_a_proposal_is_waiting_and_is_not_yet_anybody_s_mask(self) -> None:
+        self.window._select_target_index(self._first_unjudged(), confirm=False)
+        self._turn_on_semi_automatic()
+
+        self.assertIsNotNone(self.window.preview_mask, "nothing was proposed")
+        self.assertTrue(self.window.preview_mask.any())
+        for panel in self.window.view_panels.values():
+            self.assertIsNotNone(panel.canvas._preview_mask)
+        # The whole point: nothing is written until somebody says yes.
+        self.assertFalse(
+            self.window.label_volume.any(), "a proposal was written into the segmentation"
+        )
+        self.assertFalse(self.window._review_dirty, "a proposal dirtied the review")
+
+    def test_clicking_somewhere_else_re_proposes_there(self) -> None:
+        self.window._select_target_index(self._first_unjudged(), confirm=False)
+        self._turn_on_semi_automatic()
+        volume = self.window.volumes[self.window.current_modality]
+        from imaging import ras_to_voxel
+
+        before = np.array(self.window.preview_mask)
+        voxel = np.asarray(ras_to_voxel(volume.affine, self.window.target_ras), dtype=float)
+        self.window.set_tool("point")
+        self.window._on_canvas_target_clicked("axial", voxel + np.array([4.0, 4.0, 0.0]))
+
+        self.assertIsNotNone(self.window.preview_mask)
+        self.assertFalse(
+            np.array_equal(before, self.window.preview_mask),
+            "clicking elsewhere left the proposal where it was",
+        )
+        self.assertFalse(self.window.label_volume.any(), "a click wrote a mask")
+
+        # Escape puts it away rather than committing it.
+        self.window._cancel_pick_or_preview()
+        self.assertIsNone(self.window.preview_mask)
+        self.assertIsNone(self.window.view_panels["axial"].canvas._preview_mask)
+
+    def test_the_grow_settings_re_grow_what_is_on_offer(self) -> None:
+        self.window._select_target_index(self._first_unjudged(), confirm=False)
+        self._turn_on_semi_automatic()
+        before = int(np.count_nonzero(self.window.preview_mask))
+        self.window.sensitivity_spin.setValue(1.0)
+        after = int(np.count_nonzero(self.window.preview_mask))
+        self.assertNotEqual(before, after, "the numbers no longer describe what is drawn")
+        self.assertFalse(self.window.label_volume.any())
+
+    def test_accepting_records_the_position_the_mask_and_the_verdict(self) -> None:
+        index = self._first_unjudged()
+        self.window._select_target_index(index, confirm=False)
+        self._turn_on_semi_automatic()
+        target = self.window.selected_target
+        target_id = str(target["target_id"])
+        proposed = int(np.count_nonzero(self.window.preview_mask))
+        self.assertGreater(proposed, 0)
+
+        self.window.accept_finding()
+
+        rows = self.review_store.list_targets(
+            self.db_path, self.case_id, "Desktop Test Reader", 1
+        )
+        saved = next(row for row in rows if str(row["target_id"]) == target_id)
+        self.assertEqual(saved["reader_verify"], 1)
+        roi = saved.get("roi")
+        self.assertTrue(roi, "accepting recorded no mask")
+        self.assertEqual(int(roi["voxel_count"]), proposed)
+        # The mode is in the record.  One key to accept raises the acceptance
+        # rate, and "did these come out different from hand-made ones?" has to
+        # stay answerable afterwards.
+        self.assertEqual(roi["method"], "semiauto")
+
+    def test_rejecting_leaves_no_mask_behind(self) -> None:
+        index = self._first_unjudged()
+        self.window._select_target_index(index, confirm=False)
+        self._turn_on_semi_automatic()
+        target_id = str(self.window.selected_target["target_id"])
+        self.assertIsNotNone(self.window.preview_mask)
+
+        # N asks first now; answer it the way Enter would.
+        self.window._ask_no_details = lambda has_mask: {"certainty": "definite", "mimic": "", "comment": ""}
+        self.window.reject_finding()
+
+        rows = self.review_store.list_targets(
+            self.db_path, self.case_id, "Desktop Test Reader", 1
+        )
+        saved = next(row for row in rows if str(row["target_id"]) == target_id)
+        self.assertEqual(saved["reader_verify"], 0)
+        self.assertFalse(saved.get("roi"), "a finding judged 'no' was given a segmentation")
+
+    def test_it_never_proposes_over_a_mask_that_already_exists(self) -> None:
+        """Re-opening a case must not offer to redo finished work."""
+
+        index = self._first_unjudged()
+        self.window._select_target_index(index, confirm=False)
+        self._turn_on_semi_automatic()
+        target_id = str(self.window.selected_target["target_id"])
+        self.window.accept_finding()
+
+        # Accepting advances, and on a single-finding case that means the next
+        # case -- so come back deliberately rather than by index.
+        if self.window.current_case_id != self.case_id:
+            self.window.load_case(self.case_id)
+            self.assertTrue(
+                self._wait_for(
+                    lambda: self.window.current_case_id == self.case_id
+                    and self.window._load_thread is None
+                    and self.window.volumes.get("swi") is not None
+                )
+            )
+        back = next(
+            index
+            for index, target in enumerate(self.window.targets)
+            if str(target["target_id"]) == target_id
+        )
+        self.window._select_target_index(back, confirm=False)
+
+        self.assertIsNone(
+            self.window.preview_mask,
+            "it proposed a new mask over one the reader had already accepted",
+        )
+        self.assertIn("your own mask", self.window.preview_label.text().lower())
+
+    def test_picking_up_the_brush_takes_the_proposal_with_it(self) -> None:
+        self.window._select_target_index(self._first_unjudged(), confirm=False)
+        self._turn_on_semi_automatic()
+        target_id = str(self.window.selected_target["target_id"])
+        proposed = int(np.count_nonzero(self.window.preview_mask))
+
+        self.window.set_tool("brush")
+
+        self.assertIsNone(self.window.preview_mask, "the brush painted beside the proposal")
+        value = self.window.label_values.get(target_id)
+        self.assertEqual(int(np.count_nonzero(self.window.label_volume == value)), proposed)
+        self.assertEqual(self.window.label_methods.get(target_id), "semiauto")
+        # And the brush controls come back with the brush.
+        self.assertFalse(self.window.brush_spin.isHidden())
+
+    def test_the_proposal_is_grown_from_the_focus_the_position_will_snap_to(self) -> None:
+        """Otherwise the mask on screen came from somewhere the record is not.
+
+        Measured over 29 findings a reader had drawn: seeding at the raw
+        source coordinate gave median dice 0.881 against the mask they kept
+        and collapsed to a single voxel three times, seeding at the snapped
+        position gave 0.977 and collapsed once.
+        """
+
+        self.window._select_target_index(self._first_unjudged(), confirm=False)
+        before = tuple(self.window.target_ras)
+        self._turn_on_semi_automatic()
+        self.assertIsNotNone(self.window.preview_mask)
+        if self.window.preview_snapped_mm > 0.05:
+            self.assertNotEqual(tuple(self.window.target_ras), before)
+            self.assertIn("focus", self.window.preview_label.text())
+            self.assertLessEqual(
+                self.window.preview_snapped_mm,
+                self.settings.snap_radius_mm * 1.8,
+                "the proposal settled further than the snap radius allows",
+            )
+        # Whatever it settled on is where the accepted position is recorded.
+        self.assertEqual(
+            tuple(round(v, 6) for v in self.window.preview_ras),
+            tuple(round(v, 6) for v in self.window.target_ras),
+        )
+
     def test_finding_and_manual_ras_use_the_same_physical_target(self) -> None:
         target = self.review_store.list_targets(self.db_path, self.case_id, "Desktop Test Reader", 1)[0]
         expected = (float(target["ras"][0]), float(target["ras"][1]), float(target["ras"][2]))
@@ -4010,6 +4242,840 @@ class ClassicLayoutTests(unittest.TestCase):
             import shutil
 
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@unittest.skipIf(QApplication is None, "PySide6 is not installed")
+class HubModeTests(unittest.TestCase):
+    """The viewer on a shared folder: logins, read-only, and other readers' work.
+
+    Runs on the phantom from ``examples/make_demo_data.py``, so it needs no
+    study data; the "NAS" and each "PC" are temporary folders.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        cls.app = QApplication.instance() or QApplication([])
+        spec = importlib.util.spec_from_file_location(
+            "make_demo_data", VIEWER_DIR / "examples" / "make_demo_data.py"
+        )
+        demo = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(demo)
+        cls.demo_dir = Path(tempfile.mkdtemp(prefix="microbleed_hub_demo_"))
+        data_root = cls.demo_dir / "Data"
+        rng = np.random.default_rng(20240101)
+        for case_id in sorted({case for case, *_rest in demo.LESIONS}):
+            demo.write_case(data_root, case_id, rng)
+        demo.write_workbook(cls.demo_dir / "findings.xlsx")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+
+        shutil.rmtree(cls.demo_dir, ignore_errors=True)
+
+    def setUp(self) -> None:
+        import shutil
+
+        from PySide6.QtCore import QSettings
+
+        import desktop_app
+        import hub
+        import review_store
+
+        self.desktop_app, self.hub, self.review_store = desktop_app, hub, review_store
+        self.temp = Path(tempfile.mkdtemp(prefix="microbleed_hub_ui_"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.addCleanup(review_store.clear_write_guard)
+        self.addCleanup(review_store.set_write_listener, None)
+        self.addCleanup(review_store.set_label_search_roots, [])
+        previous = os.environ.get("MICROBLEED_LOCAL_ROOT")
+
+        def restore_env() -> None:
+            if previous is None:
+                os.environ.pop("MICROBLEED_LOCAL_ROOT", None)
+            else:
+                os.environ["MICROBLEED_LOCAL_ROOT"] = previous
+
+        self.addCleanup(restore_env)
+        root = self.temp / "nas"
+        root.mkdir()
+        shutil.copy2(self.demo_dir / "findings.xlsx", root / "findings.xlsx")
+        self.shared = hub.Hub.create(root, workbook=root / "findings.xlsx", data_root=self.demo_dir / "Data")
+        for name in ("Reader A", "Reader B"):
+            hub.create_reader(self.shared, name, "pw-1234")
+        self.settings = desktop_app.ViewerSettings(
+            QSettings(str(self.temp / "prefs.ini"), QSettings.Format.IniFormat)
+        )
+        self.windows: list = []
+
+    def tearDown(self) -> None:
+        for window in self.windows:
+            window._review_dirty = False
+            window.targets = []
+            window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, predicate, timeout_ms: int = 8000) -> bool:
+        from PySide6.QtCore import QElapsedTimer
+
+        timer = QElapsedTimer()
+        timer.start()
+        while not predicate() and timer.elapsed() < timeout_ms:
+            self.app.processEvents()
+        return bool(predicate())
+
+    def workspace(self, reader, pc: str):
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / pc)
+        return self.hub.prepare_workspace(self.shared, reader)
+
+    def other_reader_says(self, verify: int, comment: str) -> str:
+        """Reader A, on another PC, reviews the first finding and publishes."""
+
+        a = self.workspace("Reader A", "pc-a")
+        self.review_store.clear_write_guard()
+        self.review_store.start_new_session(a.work_db, "Reader A")
+        case = self.review_store.list_cases(a.work_db, "x", 1)[0]["case_id"]
+        target = self.review_store.list_targets(a.work_db, case, "x", 1)[0]["target_id"]
+        self.review_store.save_review(
+            a.work_db, target_id=target, case_id=case, reader_id="Reader A",
+            review_round=1, verify=verify, comment=comment,
+        )
+        self.hub.publish(a)
+        # Back to the guard the window under test runs with.
+        if self.windows:
+            self.review_store.set_write_guard(None if self.windows[-1].read_only else self.windows[-1].reader_id)
+        return str(target)
+
+    def open_window(self, reader, *, sync_seconds: float = 3600.0):
+        ws = self.workspace(reader, "pc-b")
+        if reader:
+            token = self.hub.acquire_lock(self.shared, reader, machine="PC-B")
+            self.review_store.set_write_guard(reader)
+            session = self.review_store.start_new_session(ws.work_db, reader)
+        else:
+            token = None
+            self.review_store.set_write_guard(None)
+            session = dict(self.desktop_app.READ_ONLY_SESSION)
+        sync = self.desktop_app.HubSync(ws, token, pull_seconds=sync_seconds, debounce_seconds=0.05)
+        window = self.desktop_app.MicrobleedViewer(
+            ws.work_db, self.shared.data_root, session, settings=self.settings,
+            hub_sync=sync, read_only=reader is None,
+        )
+        self.windows.append(window)
+        window.show()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.current_case_id is not None
+                and window._load_thread is None
+                and window.selected_target is not None
+            )
+        )
+        return window, ws
+
+    def test_read_only_window_refuses_saves_and_segmentation(self) -> None:
+        window, ws = self.open_window(None)
+
+        self.assertIn("READ-ONLY", window.windowTitle())
+        self.assertIn("read-only", (window.segmentation_block() or "").lower())
+        window._verdict = 1
+        window._review_dirty = True
+        self.assertFalse(window.save_current_review())
+        connection = self.review_store.connect(ws.work_db)
+        try:
+            rows = connection.execute("SELECT COUNT(*) FROM review_annotations").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(rows, 0)
+
+    def test_another_readers_report_appears_without_touching_the_form(self) -> None:
+        window, ws = self.open_window("Reader B")
+        target = self.other_reader_says(0, "a vessel, surely")
+        window._select_target_id(target)
+        window.comment_edit.setPlainText("my unsaved thought")
+        window._review_dirty = True
+        cursor = window.target_ras
+
+        self.hub.pull_others(ws)
+        window._refresh_other_readers(["Reader A"])
+
+        self.assertIn("Reader A", window.reports_browser.toPlainText())
+        self.assertIn("a vessel, surely", window.reports_browser.toPlainText())
+        self.assertEqual(window.comment_edit.toPlainText(), "my unsaved thought")
+        self.assertTrue(window._review_dirty)
+        self.assertEqual(window.target_ras, cursor)
+
+    def test_the_sync_thread_brings_other_readers_in_and_publishes_saves(self) -> None:
+        window, _ws = self.open_window("Reader B", sync_seconds=0.2)
+        target = self.other_reader_says(1, "clear focus")
+        window._select_target_id(target)
+        self.assertTrue(self._wait_for(lambda: "clear focus" in window.reports_browser.toPlainText()))
+
+        window._verdict = 0
+        window._review_dirty = True
+        self.assertTrue(window.save_current_review(advance=False))
+        self.assertTrue(
+            self._wait_for(
+                lambda: int(self.hub.remote_state(self.shared, "Reader B").get("revision") or 0) > 0
+            )
+        )
+        self.assertTrue(self._wait_for(lambda: "Synced" in window._hub_status_label.text()))
+
+    def test_a_close_that_outlasts_the_last_publish_says_so(self) -> None:
+        import time as _time
+        from unittest import mock
+
+        ws = self.workspace("Reader B", "pc-slow")
+        self.hub.mark_dirty(ws)
+        sync = self.desktop_app.HubSync(ws, None, pull_seconds=3600, debounce_seconds=0.0)
+        real_publish = self.hub.publish
+
+        def slow_publish(workspace, **kwargs):
+            _time.sleep(1.5)
+            return real_publish(workspace, **kwargs)
+
+        with mock.patch.object(self.desktop_app.hub_store, "publish", slow_publish):
+            sync.start()
+            self._wait_for(lambda: False, timeout_ms=200)
+            self.assertFalse(sync.stop_and_flush(timeout_s=0.3))
+            sync.wait(10000)
+
+    def test_switch_opens_another_round_of_the_same_reader(self) -> None:
+        from unittest import mock
+
+        window, ws = self.open_window("Reader B")
+        self.assertTrue(window.switch_session_btn.isEnabled())
+        window._ask_switch_kind = lambda choices: "round"
+        second = self.review_store.start_new_session(ws.work_db, "Reader B")
+        with mock.patch.object(self.desktop_app, "choose_session", lambda *args, **kwargs: second):
+            self.assertTrue(window.switch_session())
+        self.app.processEvents()
+
+        self.assertEqual(window.review_round, second["review_round"])
+        self.assertEqual(window.reader_id, "Reader B")
+        self.assertFalse(window.read_only)
+        self.assertIsNotNone(window._hub_sync)
+
+    def test_switching_reader_closes_the_window_for_a_new_sign_in(self) -> None:
+        window, _ws = self.open_window("Reader B")
+        window._ask_switch_kind = lambda choices: "reader"
+
+        window.switch_session()
+        self.app.processEvents()
+
+        self.assertTrue(window.sign_in_again)
+        self.assertFalse(window.isVisible())
+        # The reader is given back, so the next sign-in -- here or on any PC -- can take it.
+        self.assertIsNone(self.hub.read_lock(self.shared, "Reader B"))
+
+    def test_a_read_only_window_can_only_sign_in(self) -> None:
+        window, _ws = self.open_window(None)
+        offered = []
+        window._ask_switch_kind = lambda choices: offered.append(list(choices)) or None
+        window.switch_session()
+        self.assertEqual(offered, [["reader"]])
+
+    # ------------------------------------------------ where a round resumes --
+    def _resumed_window(self, slices: dict[str, int]):
+        """A session that stopped on the last finding of the last case."""
+
+        ws = self.workspace("Reader B", "pc-resume")
+        self.review_store.set_write_guard("Reader B")
+        cases = self.review_store.list_cases(ws.work_db, "Reader B", 1)
+        case = cases[-1]["case_id"]
+        target = self.review_store.list_targets(ws.work_db, case, "Reader B", 1)[-1]["target_id"]
+        first = self.review_store.start_new_session(ws.work_db, "Reader B")
+        self.review_store.save_session_state(
+            ws.work_db, first["session_id"],
+            {"case_id": case, "target_id": target, "modality": "swi", **slices},
+        )
+        session = self.review_store.resume_session(ws.work_db, first["session_id"])
+        window = self.desktop_app.MicrobleedViewer(
+            ws.work_db, self.shared.data_root, session, settings=self.settings,
+        )
+        self.windows.append(window)
+        window.show()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.current_case_id == case and window._load_thread is None
+                and window.selected_target is not None
+                and window.volumes.get(window.current_modality) is not None
+            )
+        )
+        return window, ws, cases, case
+
+    def _on_the_finding(self, window) -> bool:
+        from imaging import ras_to_voxel
+
+        volume = window.volumes[window.current_modality]
+        voxel = ras_to_voxel(volume.affine, window.marker_ras)
+        return all(
+            window.view_panels[plane].canvas.slice_index
+            == int(round(float(voxel[window.view_panels[plane].canvas.slice_axis])))
+            for plane in ("axial", "coronal", "sagittal")
+        )
+
+    def test_a_resumed_position_is_restored_once_not_on_every_visit(self) -> None:
+        window, _ws, cases, case = self._resumed_window({"axial": 40, "coronal": 50, "sagittal": 60})
+        self.assertEqual(window.view_panels["axial"].canvas.slice_index, 40)
+
+        window.load_case(cases[0]["case_id"])
+        self._wait_for(lambda: window.current_case_id == cases[0]["case_id"] and window._load_thread is None)
+        window.load_case(case)
+        self._wait_for(lambda: window.current_case_id == case and window._load_thread is None)
+
+        self.assertTrue(self._on_the_finding(window))
+
+    def test_a_saved_position_of_all_zeros_is_not_restored(self) -> None:
+        window, _ws, _cases, _case = self._resumed_window({"axial": 0, "coronal": 0, "sagittal": 0})
+        self.assertTrue(self._on_the_finding(window))
+
+    def test_no_slice_position_is_saved_while_the_views_are_empty(self) -> None:
+        window, ws, _cases, _case = self._resumed_window({"axial": 40, "coronal": 50, "sagittal": 60})
+        for panel in window.view_panels.values():
+            panel.canvas.set_volume(None)
+        window._save_session_state()
+        window._writer.stop()
+        connection = self.review_store.connect(ws.work_db)
+        try:
+            row = connection.execute(
+                "SELECT last_axial, last_coronal, last_sagittal FROM reader_sessions "
+                "WHERE session_id = ?", (window.session_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(tuple(row), (None, None, None))
+
+    # ------------------------------------------- looking at someone's work --
+    def _viewing_window(self):
+        """Reader A's round 1, opened read-only on another PC."""
+
+        target = self.other_reader_says(1, "clear focus")
+        a = self.workspace("Reader A", "pc-a")
+        case = self.review_store.list_cases(a.work_db, "x", 1)[0]["case_id"]
+        mask = self.review_store.label_path(a.work_db, case, "Reader A", 1)
+        mask.parent.mkdir(parents=True, exist_ok=True)
+        from imaging import load_volume, save_label_volume
+
+        case_row = self.review_store.get_case(a.work_db, case)
+        reference = load_volume(case_row["swi_path"], self.settings.axcodes)
+        labels = np.zeros(reference.data.shape, dtype=np.uint16)
+        labels[10:13, 10:13, 10:13] = 1
+        save_label_volume(mask, labels, reference)
+        self.review_store.clear_write_guard()
+        self.review_store.save_roi(
+            a.work_db, target_id=target, case_id=case, reader_id="Reader A", review_round=1,
+            label_value=1, path=mask, voxel_count=27, volume_mm3=1.0, generated_from="swi",
+        )
+        self.hub.publish(a)
+        viewer = self.workspace(None, "pc-view")
+        self.hub.pull_others(viewer)
+        self.review_store.set_write_guard(None)
+        session = {"session_id": "", "reader_id": "Reader A", "review_round": 1}
+        window = self.desktop_app.MicrobleedViewer(
+            viewer.work_db, self.shared.data_root, session, settings=self.settings,
+            hub_sync=self.desktop_app.HubSync(viewer, None, pull_seconds=3600), read_only=True,
+        )
+        self.windows.append(window)
+        window.show()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.current_case_id == case and window._load_thread is None
+                and window.selected_target is not None
+            )
+        )
+        window._select_target_id(target)
+        return window, case, target
+
+    def test_viewing_a_reader_shows_their_progress_and_verdicts(self) -> None:
+        window, case, target = self._viewing_window()
+
+        row = next(item for item in window.all_cases if item["case_id"] == case)
+        self.assertEqual(row["reviewed_count"], 1)
+        self.assertEqual(window._verdict, 1)
+        self.assertIn("Reader A", window.windowTitle())
+        self.assertIn("READ-ONLY", window.windowTitle())
+
+    def test_viewing_a_reader_shows_their_mask_from_the_shared_folder(self) -> None:
+        window, _case, _target = self._viewing_window()
+        self.assertIsNotNone(window.label_volume)
+        self.assertEqual(int(np.count_nonzero(window.label_volume)), 27)
+
+    def test_nothing_can_be_changed_while_viewing(self) -> None:
+        window, _case, _target = self._viewing_window()
+
+        for widget in (
+            window.verdict_segments, window.certainty_combo, window.mimic_combo,
+            window.save_review_btn, window.save_segment_btn, window.save_next_btn,
+            window.segment_save_btn, window.segment_next_btn, window.move_here_btn,
+            window.add_manual_btn, window.segment_panel,
+        ):
+            with self.subTest(widget=type(widget).__name__):
+                self.assertFalse(widget.isEnabled())
+        self.assertTrue(window.comment_edit.isReadOnly())
+        window._on_verdict_selected("no")
+        window._mark_review_dirty()
+        self.assertEqual(window._verdict, 1)
+        self.assertFalse(window._review_dirty)
+
+    def test_browsing_read_only_opens_the_selected_readers_round(self) -> None:
+        self.other_reader_says(1, "clear focus")
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-browse")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_reader("Reader A")
+        dialog._browse_read_only()
+
+        self.assertTrue(dialog.read_only)
+        self.assertEqual(dialog.session["reader_id"], "Reader A")
+        self.assertEqual(dialog.session["review_round"], 1)
+        self.assertIsNone(dialog.token)
+
+    def test_browsing_needs_a_reader_with_published_work(self) -> None:
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-browse-none")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_new_reader()
+        dialog._browse_read_only()
+        self.assertIsNone(dialog.session)
+        self.assertTrue(dialog.error_label.text())
+
+        dialog.select_reader("Reader B")  # has not published anything
+        dialog._browse_read_only()
+        self.assertIsNone(dialog.session)
+        self.assertIn("Reader B", dialog.error_label.toolTip())
+
+    def test_viewing_offers_only_existing_rounds(self) -> None:
+        rounds = [
+            {"review_round": 1, "session_id": "a", "reviewed_count": 3},
+            {"review_round": 2, "session_id": "b", "reviewed_count": 1},
+        ]
+        dialog = self.desktop_app.RoundDialog("Reader A", rounds, allow_new=False)
+        values = [dialog.list.item(i).data(0x0100) for i in range(dialog.list.count())]
+        self.assertEqual(values, [1, 2])
+
+    def test_losing_the_reader_to_another_pc_makes_the_window_read_only(self) -> None:
+        window, _ws = self.open_window("Reader B")
+        window._hub_sync.lockLost.emit("Reader B was taken over by PC-C")
+        self.app.processEvents()
+
+        self.assertTrue(window.read_only)
+        self.assertIn("read-only", (window.segmentation_block() or "").lower())
+        with self.assertRaises(self.review_store.ReadOnlyError):
+            self.review_store.log_event(window.db_path, "x", reader_id="Reader B")
+
+    def test_login_needs_the_right_password(self) -> None:
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-login")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_reader("Reader A")
+        dialog.password_edit.setText("wrong")
+        dialog._open_review()
+        self.assertIsNone(dialog.session)
+        self.assertIn("password", dialog.error_label.text().lower())
+
+        dialog.password_edit.setText("pw-1234")
+        dialog._open_review()
+        self.assertIsNotNone(dialog.session)
+        self.assertEqual(dialog.session["reader_id"], "Reader A")
+        self.assertFalse(dialog.read_only)
+        self.assertIsNotNone(dialog.token)
+        self.assertTrue(dialog.workspace.work_db.is_file())
+
+    def test_a_long_path_in_an_error_is_shown_whole_and_can_be_copied(self) -> None:
+        from PySide6.QtCore import Qt
+        ZERO_WIDTH_SPACE = "\u200b"
+
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-error")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        path = chr(92).join(["C:", "Users", "someone", "AppData", "Local", "MicrobleedReview", "hubs", "ab" * 16, "Reader_A", "source.xlsx"])
+        dialog._fail(f"Could not copy {path}: [WinError 2]")
+
+        # Breakable after each backslash, so the label can wrap it...
+        self.assertEqual(dialog.error_label.text().replace(ZERO_WIDTH_SPACE, ""), f"Could not copy {path}: [WinError 2]")
+        self.assertIn("\\" + ZERO_WIDTH_SPACE, dialog.error_label.text())
+        # ...and selectable, with the exact text in the tooltip for copying.
+        self.assertTrue(dialog.error_label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.assertEqual(dialog.error_label.toolTip(), f"Could not copy {path}: [WinError 2]")
+
+    def test_an_error_makes_the_dialog_taller_instead_of_squeezing_the_fields(self) -> None:
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-squeeze")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_reader("Reader A")
+        dialog.show()
+        self.app.processEvents()
+        height = dialog.height()
+
+        dialog._fail("Could not copy " + "x" * 400 + ": [WinError 2] The system cannot find the file specified")
+        self.app.processEvents()
+
+        for field in (dialog.reader_combo, dialog.password_edit):
+            with self.subTest(field=field.objectName() or type(field).__name__):
+                self.assertGreaterEqual(field.height(), field.sizeHint().height())
+        self.assertGreater(dialog.height(), height)
+        dialog.close()
+
+    def test_an_uncaught_exception_is_written_to_the_log(self) -> None:
+        """Under run_app.bat a traceback only reaches a console nobody reads."""
+
+        import sys as _sys
+
+        log = self.temp / "viewer.log"
+        previous = _sys.excepthook
+        self.addCleanup(setattr, _sys, "excepthook", previous)
+        self.desktop_app.install_diagnostics(log)
+        try:
+            raise ValueError("cannot convert float NaN to integer")
+        except ValueError:
+            _sys.excepthook(*_sys.exc_info())
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("Traceback", text)
+        self.assertIn("cannot convert float NaN to integer", text)
+
+    def test_a_new_reader_chooses_a_password(self) -> None:
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-new")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_new_reader()
+        dialog.name_edit.setText("Reader C")
+        dialog.password_edit.setText("pw-5678")
+        dialog.confirm_edit.setText("pw-5679")
+        dialog._open_review()
+        self.assertIsNone(dialog.session)
+        self.assertIn("match", dialog.error_label.text().lower())
+
+        dialog.confirm_edit.setText("pw-5678")
+        dialog._open_review()
+        self.assertIsNotNone(dialog.session)
+        self.assertTrue(self.hub.verify_reader(self.shared, "Reader C", "pw-5678"))
+
+    def test_a_reader_without_a_password_sets_one_at_login(self) -> None:
+        self.hub.reset_password(self.shared, "Reader A")
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-reset")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        dialog.select_reader("Reader A")
+        self.assertTrue(dialog.confirm_edit.isVisibleTo(dialog))
+        dialog.password_edit.setText("pw-new-1")
+        dialog.confirm_edit.setText("pw-new-1")
+        dialog._open_review()
+        self.assertIsNotNone(dialog.session)
+        self.assertTrue(self.hub.verify_reader(self.shared, "Reader A", "pw-new-1"))
+
+    def test_the_shared_folder_comes_from_the_environment_or_the_config(self) -> None:
+        configured = self.desktop_app.configured_hub
+        saved = os.environ.pop("MICROBLEED_HUB", None)
+        try:
+            self.assertIsNone(configured({"paths": {"hub": ""}}))
+            self.assertEqual(configured({"paths": {"hub": "Z:/review"}}), Path("Z:/review"))
+            os.environ["MICROBLEED_HUB"] = str(self.shared.root)
+            self.assertEqual(configured({"paths": {"hub": "Z:/review"}}), self.shared.root)
+        finally:
+            os.environ.pop("MICROBLEED_HUB", None)
+            if saved is not None:
+                os.environ["MICROBLEED_HUB"] = saved
+
+    def test_the_dataset_dialog_can_open_a_shared_folder(self) -> None:
+        dataset = self.desktop_app.Dataset.create(self.temp / "x.xlsx", self.temp, self.temp / "x.sqlite")
+        dialog = self.desktop_app.DatasetDialog(self.settings, dataset)
+
+        dialog._ask_for_hub_folder = lambda: str(self.temp)
+        dialog._use_shared_folder()
+        self.assertIsNone(dialog.hub_root)
+        self.assertIn("not a shared", dialog.problem_label.text())
+
+        dialog._ask_for_hub_folder = lambda: str(self.shared.root)
+        dialog._use_shared_folder()
+        self.assertEqual(dialog.hub_root, self.shared.root)
+        self.assertEqual(dialog.result(), self.desktop_app.QDialog.DialogCode.Accepted)
+
+    def test_choosing_a_shared_folder_is_remembered(self) -> None:
+        import dataset_config
+
+        target = self.temp / "config.json"
+        config = self.desktop_app.remember_hub(dataset_config.load(target), self.shared.root, path=target)
+
+        self.assertEqual(Path(config["paths"]["hub"]), self.shared.root)
+        self.assertEqual(Path(dataset_config.load(target)["paths"]["hub"]), self.shared.root)
+
+    def test_a_reader_open_on_another_pc_is_offered_read_only(self) -> None:
+        self.other_reader_says(1, "clear focus")
+        self.hub.acquire_lock(self.shared, "Reader A", machine="SOMEWHERE-ELSE")
+        os.environ["MICROBLEED_LOCAL_ROOT"] = str(self.temp / "pc-busy")
+        dialog = self.desktop_app.HubLoginDialog(self.shared, settings=self.settings)
+        asked = []
+
+        def answer(holder, stale):
+            asked.append((holder["machine"], stale))
+            return "readonly"
+
+        dialog._ask_about_lock = answer
+        dialog.select_reader("Reader A")
+        dialog.password_edit.setText("pw-1234")
+        dialog._open_review()
+
+        self.assertEqual(asked, [("SOMEWHERE-ELSE", False)])
+        self.assertTrue(dialog.read_only)
+        # Their own work, read-only -- not an empty reader.
+        self.assertEqual(dialog.session["reader_id"], "Reader A")
+
+
+@unittest.skipIf(QApplication is None, "PySide6 is not installed")
+class SemiAutoWorkflowTests(unittest.TestCase):
+    """Y, N and the grow keys in semi-automatic mode, on the phantom study."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        cls.app = QApplication.instance() or QApplication([])
+        spec = importlib.util.spec_from_file_location(
+            "make_demo_data", VIEWER_DIR / "examples" / "make_demo_data.py"
+        )
+        demo = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(demo)
+        cls.demo_dir = Path(tempfile.mkdtemp(prefix="microbleed_semiauto_demo_"))
+        rng = np.random.default_rng(20240101)
+        for case_id in sorted({case for case, *_rest in demo.LESIONS}):
+            demo.write_case(cls.demo_dir / "Data", case_id, rng)
+        demo.write_workbook(cls.demo_dir / "findings.xlsx")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+
+        shutil.rmtree(cls.demo_dir, ignore_errors=True)
+
+    def setUp(self) -> None:
+        import shutil
+
+        from PySide6.QtCore import QSettings
+
+        import desktop_app
+        import review_store
+
+        self.desktop_app, self.review_store = desktop_app, review_store
+        self.temp = Path(tempfile.mkdtemp(prefix="microbleed_semiauto_"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.db = self.temp / "review.sqlite"
+        review_store.initialize_store(self.demo_dir / "findings.xlsx", self.demo_dir / "Data", self.db)
+        session = review_store.start_new_session(self.db, "Semi Reader")
+        self.settings = desktop_app.ViewerSettings(
+            QSettings(str(self.temp / "prefs.ini"), QSettings.Format.IniFormat)
+        )
+        self.settings.store.setValue("reading/semi_automatic", True)
+        # Stay on the finding after saving, so a test can look at what it saved.
+        self.settings.store.setValue("reading/save_advances", False)
+        self.window = desktop_app.MicrobleedViewer(
+            self.db, self.demo_dir / "Data", session, settings=self.settings
+        )
+        self.window.show()
+        self.assertTrue(
+            self._wait_for(
+                lambda: self.window.current_case_id is not None
+                and self.window._load_thread is None
+                and self.window.selected_target is not None
+                and self.window.preview_mask is not None
+            ),
+            "a proposal should be on the first finding",
+        )
+
+    def tearDown(self) -> None:
+        self.window._review_dirty = False
+        self.window._roi_dirty = False
+        self.window.targets = []
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, predicate, timeout_ms: int = 8000) -> bool:
+        from PySide6.QtCore import QElapsedTimer
+
+        timer = QElapsedTimer()
+        timer.start()
+        while not predicate() and timer.elapsed() < timeout_ms:
+            self.app.processEvents()
+        return bool(predicate())
+
+    def saved(self, target_id: str):
+        connection = self.review_store.connect(self.db)
+        try:
+            return connection.execute(
+                "SELECT verify, certainty, mimic, comment FROM review_annotations "
+                "WHERE target_id = ? AND reader_id = 'Semi Reader'", (target_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+
+    def roi_rows(self, target_id: str) -> int:
+        connection = self.review_store.connect(self.db)
+        try:
+            return connection.execute(
+                "SELECT COUNT(*) FROM roi_labels WHERE target_id = ? AND reader_id = 'Semi Reader'",
+                (target_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    # ------------------------------------------------------------------- Y --
+    def test_y_records_definite_when_nothing_was_chosen(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        self.window.accept_finding()
+        row = self.saved(target)
+        self.assertEqual((row["verify"], row["certainty"]), (1, "definite"))
+
+    def test_y_keeps_a_certainty_the_reader_chose(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        combo = self.window.certainty_combo
+        combo.setCurrentIndex(combo.findData("probable"))
+        self.window.accept_finding()
+        self.assertEqual(self.saved(target)["certainty"], "probable")
+
+    def test_y_refuses_a_proposal_that_never_left_the_seed(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        single = np.zeros_like(self.window.preview_mask, dtype=bool)
+        single[tuple(int(v) for v in np.argwhere(self.window.preview_mask)[0])] = True
+        self.window.preview_mask = single
+        self.window.preview_details = {"voxel_count": 1}
+
+        self.window.accept_finding()
+
+        self.assertIsNone(self.saved(target))
+        self.assertEqual(self.roi_rows(target), 0)
+        self.assertIn("seed", self.window._status_label.text().lower())
+
+    # ------------------------------------------------------------------- N --
+    def test_n_asks_for_certainty_what_else_and_a_comment(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        asked = []
+        self.window._ask_no_details = lambda has_mask: asked.append(has_mask) or {
+            "certainty": "probable", "mimic": "vessel", "comment": "runs across three slices",
+        }
+        self.window.reject_finding()
+
+        self.assertEqual(asked, [False])
+        row = self.saved(target)
+        self.assertEqual(
+            (row["verify"], row["certainty"], row["mimic"], row["comment"]),
+            (0, "probable", "vessel", "runs across three slices"),
+        )
+
+    def test_n_cancelled_saves_nothing(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        self.window._ask_no_details = lambda has_mask: None
+        self.window.reject_finding()
+        self.assertIsNone(self.saved(target))
+        self.assertIsNotNone(self.window.selected_target)
+        self.assertEqual(str(self.window.selected_target["target_id"]), target)
+
+    def test_n_on_a_finding_with_a_mask_removes_the_mask(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        self.window.accept_finding()
+        self.assertEqual(self.roi_rows(target), 1)
+        self.window._select_target_id(target)  # Y moved on; come back to it
+        asked = []
+        self.window._ask_no_details = lambda has_mask: asked.append(has_mask) or {
+            "certainty": "definite", "mimic": "", "comment": "",
+        }
+
+        self.window.reject_finding()
+
+        self.assertEqual(asked, [True])
+        self.assertEqual(self.saved(target)["verify"], 0)
+        self.assertEqual(self.roi_rows(target), 0)
+        value = self.window.label_values.get(target)
+        self.assertFalse(value is not None and bool(np.any(self.window.label_volume == value)))
+
+    # ------------------------------------------------------------ the keys --
+    def test_delete_clears_the_own_mask_and_undo_brings_it_back(self) -> None:
+        self.window._commit_preview()
+        mask = self.window._selected_label_mask()
+        drawn = int(mask.sum())
+        self.assertGreater(drawn, 0)
+
+        self.window._shortcut_callbacks()["clear_roi"]()
+        self.assertEqual(int(self.window._selected_label_mask().sum()), 0)
+        self.window.undo_roi()
+        self.assertEqual(int(self.window._selected_label_mask().sum()), drawn)
+
+    def test_the_sensitivity_keys_step_and_regrow_the_proposal(self) -> None:
+        spin = self.window.sensitivity_spin
+        before = spin.value()
+        callbacks = self.window._shortcut_callbacks()
+
+        callbacks["sensitivity_up"]()
+        self.assertAlmostEqual(spin.value(), before + spin.singleStep())
+        callbacks["sensitivity_down"]()
+        callbacks["sensitivity_down"]()
+        self.assertAlmostEqual(spin.value(), before - spin.singleStep())
+        self.assertIsNotNone(self.window.preview_mask)
+
+    def test_the_new_keys_are_bound_where_nothing_else_is(self) -> None:
+        keys = {action: default for action, _label, default, _group in self.desktop_app.SHORTCUT_ACTIONS}
+        self.assertEqual(
+            (keys["sensitivity_down"], keys["sensitivity_up"], keys["clear_roi"]), (",", ".", "Del")
+        )
+        self.assertEqual(len(set(keys.values())), len(keys))
+
+    # --------------------------------------- seeing, and not seeing, it --
+    def test_hiding_the_segmentation_hides_the_proposal_too(self) -> None:
+        canvas = self.window.view_panels["axial"].canvas
+        self.assertTrue(canvas.preview_visible())
+        self.window.show_roi_cb.setChecked(False)
+        self.assertFalse(canvas.preview_visible())
+        self.window.show_roi_cb.setChecked(True)
+        self.assertTrue(canvas.preview_visible())
+
+    def test_clear_drops_a_proposal(self) -> None:
+        self.assertIsNotNone(self.window.preview_mask)
+        self.window.clear_roi()
+        self.assertIsNone(self.window.preview_mask)
+        self.window._shortcut_callbacks()["clear_roi"]  # the Del key is the same action
+
+    # ------------------------------------------- a click is where it lands --
+    def _click_beside_the_lesion(self):
+        """One voxel off the focus: the old snap walked back to the centre."""
+
+        from imaging import ras_to_voxel, voxel_to_ras
+
+        self.settings.store.setValue("reading/snap_to_lesion", True)
+        volume = self.window.volumes[self.window.current_modality]
+        centre = np.round(ras_to_voxel(volume.affine, self.window.preview_ras)).astype(int)
+        clicked = centre + np.array([1, 0, 0])
+        self.window.set_tool("point")
+        self.window._on_canvas_target_clicked("axial", clicked.astype(np.float64))
+        return tuple(float(v) for v in voxel_to_ras(volume.affine, clicked.astype(np.float64)))
+
+    def test_a_click_grows_from_exactly_where_it_landed(self) -> None:
+        clicked = self._click_beside_the_lesion()
+        np.testing.assert_allclose(self.window.target_ras, clicked, atol=1e-6)
+        np.testing.assert_allclose(self.window.preview_ras, clicked, atol=1e-6)
+        self.assertEqual(self.window.preview_snapped_mm, 0.0)
+
+    def test_y_records_the_point_the_proposal_grew_from(self) -> None:
+        target = str(self.window.selected_target["target_id"])
+        clicked = self._click_beside_the_lesion()
+        self.window.accept_finding()
+        connection = self.review_store.connect(self.db)
+        try:
+            row = connection.execute(
+                "SELECT ras_l, ras_p, ras_s FROM review_annotations WHERE target_id = ?", (target,)
+            ).fetchone()
+        finally:
+            connection.close()
+        np.testing.assert_allclose(tuple(row), clicked, atol=1e-6)
+
+    # ------------------------------------------------------------ comment --
+    def test_the_comment_box_takes_the_room_a_normal_window_has(self) -> None:
+        # One line was too small to write in.  The smallest window still has
+        # to fit without scrolling (DesktopViewerTests checks that), so the box
+        # grows into whatever room the window has instead of being fixed.
+        self.window.resize(1540, 960)
+        self._wait_for(lambda: False, timeout_ms=300)
+        self.assertGreaterEqual(self.window.comment_edit.height(), 40)
+
+    # ------------------------------------------------------------- readout --
+    def test_reaching_the_radius_cap_is_a_note_not_a_warning(self) -> None:
+        self.window.preview_details = {**(self.window.preview_details or {}), "reached_cap": True}
+        self.window._refresh_preview_readout()
+        style = self.window.preview_label.styleSheet()
+        self.assertNotIn(self.desktop_app.COLORS["warn"], style)
+        self.assertIn("cap", self.window.preview_label.text())
 
 
 if __name__ == "__main__":

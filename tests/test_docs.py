@@ -198,13 +198,18 @@ class DocumentationTests(unittest.TestCase):
             r"tests/\s+" + str(total) + r" 个测试",
             f"FEATURES.md should show the suite at {total}",
         )
-        self.assertRegex(
+        # Built from whatever modules are here rather than from three named
+        # ones: tests/test_publish.py exists only in the working repository,
+        # and a hard-coded trio would have gone on reporting a total that its
+        # own three parts do not add up to.
+        breakdown = " + ".join(
+            f"{path.removeprefix('test_').removesuffix('.py').removesuffix('_app')} {count}"
+            for path, count in counts.items()
+        )
+        self.assertIn(
+            f"测试数量 | {total}（{breakdown}）",
             self.changelog,
-            r"测试数量 \| " + str(total) + r"（core "
-            + str(counts["test_core.py"]) + r" \+ desktop "
-            + str(counts["test_desktop_app.py"]) + r" \+ docs "
-            + str(counts["test_docs.py"]) + r"）",
-            f"CHANGELOG.md should show the suite at {total}",
+            f"CHANGELOG.md should show the suite at {total}（{breakdown}）",
         )
         # The overview quotes the per-module figures as its QA record, and a
         # stale one there is worse than none: it said 15 and 8 for weeks.

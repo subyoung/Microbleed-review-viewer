@@ -22,6 +22,7 @@ state and logs use the shared SQLite store from ``review_store.py``.
 
 import faulthandler
 import threading
+import traceback
 import time
 import json
 import math
@@ -52,6 +53,7 @@ try:  # Keep the import error useful when somebody launches before installing.
         qInstallMessageHandler,
     )
     from PySide6.QtGui import (
+        QAction,
         QColor,
         QFont,
         QIcon,
@@ -152,6 +154,7 @@ try:
         MODALITY_SPECS,
         configure as review_store_configure,
         SourceReadError,
+        ReadOnlyError,
         add_manual_annotation,
         delete_manual_annotation,
         export_reviews,
@@ -166,6 +169,7 @@ try:
         distance_mm as _distance_mm,
         label_path,
         list_targets,
+        resolve_label_path,
         log_event,
         refresh_inventory_store,
         resume_session,
@@ -173,9 +177,12 @@ try:
         save_roi,
         save_session_state,
         set_busy_timeout_ms,
+        set_write_guard,
+        set_write_listener,
         start_new_session,
         close_session,
     )
+    import hub as hub_store
 except ImportError as exc:  # pragma: no cover - launch-path guard
     raise RuntimeError(
         "Could not import the viewer data layer. Launch this file via "
@@ -277,6 +284,11 @@ SHORTCUT_ACTIONS: tuple[tuple[str, str, str, str], ...] = (
     ("brush_smaller", "Smaller brush", "-", "Review"),
     ("brush_larger", "Larger brush", "=", "Review"),
     ("undo_roi", "Undo the last brush stroke", "Ctrl+Z", "Review"),
+    # Lower sensitivity lets more in.  Measured on round 1, a failed proposal
+    # is nearly always too small, so "," is the one that gets pressed.
+    ("sensitivity_down", "Grow the proposal larger (lower sensitivity)", ",", "Review"),
+    ("sensitivity_up", "Grow the proposal smaller (higher sensitivity)", ".", "Review"),
+    ("clear_roi", "Clear this finding's segmentation", "Del", "Review"),
     ("overlay_target", "Finding crosshair on / off", "X", "View"),
     ("overlay_mouse", "Mouse crosshair on / off", "C", "View"),
     ("overlay_labels", "Direction labels on / off", "D", "View"),
@@ -415,6 +427,9 @@ COLORS = {
     # the saturated versions rather than the softer ones used when a colour
     # is on screen on its own.
     "compare_ours": "#ffd400",
+    # A mask that has been proposed and not accepted.  Not yellow, because it
+    # is not the reader's yet.
+    "preview": "#35e0ff",
     "compare_both": "#22e06a",
     "direction": "#f2b000",
 }
@@ -661,6 +676,28 @@ def _human_count(count: int, singular: str, plural: str | None = None) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
+class CommentEdit(QTextEdit):
+    """A comment box that asks for its minimum height and takes what is spare.
+
+    A text edit's own size hint is tall, and a panel's preferred size adds it
+    up -- so allowing the box to grow made the panel "want" more than the
+    smallest window has, and scroll.  Asking for the minimum and growing by
+    stretch keeps both: one line in the smallest window, more wherever there
+    is room.
+    """
+
+    def sizeHint(self):  # noqa: N802 - Qt API
+        hint = super().sizeHint()
+        hint.setHeight(self.minimumHeight())
+        return hint
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt API
+        # A text edit's own is 84px, and a layout takes the larger of the two.
+        hint = super().minimumSizeHint()
+        hint.setHeight(self.minimumHeight())
+        return hint
+
+
 class ElidedLabel(QLabel):
     """A single-line label that shrinks by eliding rather than by demanding space.
 
@@ -863,6 +900,16 @@ class ViewerSettings:
         return self._bool("reading/save_advances", True)
 
     @property
+    def semi_automatic(self) -> bool:
+        """One panel, and a proposed mask waiting on the reader's yes.
+
+        Off by default: it changes what a keypress commits, and a reader who
+        has not asked for that should not discover it by pressing Y.
+        """
+
+        return self._bool("reading/semi_automatic", False)
+
+    @property
     def developer_mode(self) -> bool:
         """Show the tools for looking at somebody else's model output.
 
@@ -974,6 +1021,7 @@ class ViewerSettings:
         save_advances: bool,
         default_modality: str,
         keep_tool_on_switch: bool | None = None,
+        semi_automatic: bool | None = None,
         orientation: str | None = None,
         prefetch: bool | None = None,
         snap_to_lesion: bool | None = None,
@@ -985,6 +1033,8 @@ class ViewerSettings:
         self.store.setValue("reading/save_advances", bool(save_advances))
         if keep_tool_on_switch is not None:
             self.store.setValue("reading/keep_tool_on_switch", bool(keep_tool_on_switch))
+        if semi_automatic is not None:
+            self.store.setValue("reading/semi_automatic", bool(semi_automatic))
         self.store.setValue("reading/default_modality", str(default_modality))
         if prefetch is not None:
             self.store.setValue("reading/prefetch", bool(prefetch))
@@ -1310,6 +1360,31 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.keep_tool_cb)
 
         layout.addWidget(_separator())
+        self.semi_auto_cb = QCheckBox("Semi-automatic: propose a mask, and confirm both at once")
+        self.semi_auto_cb.setChecked(settings.semi_automatic)
+        self.semi_auto_cb.setToolTip(
+            "Review and Segment become one panel.  Arriving at a finding that\n"
+            "has no mask yet grows one from its position and shows it as a\n"
+            "proposal; clicking somewhere else re-grows it there.  Y accepts\n"
+            "the position, the mask and the verdict together and moves on,\n"
+            "N records 'not a microbleed', B picks up the brush on it.\n\n"
+            "Nothing is written until you accept it."
+        )
+        layout.addWidget(self.semi_auto_cb)
+        semi_note = _label(
+            "Measured on this database: the source coordinate was corrected on "
+            "236 of 236 reviews, and a grow at the reader's own position "
+            "reproduced the mask they kept in 17 of 27 findings exactly. So the "
+            "click is happening anyway and the proposal is usually right — which "
+            "is also why accepting has to stay a decision rather than a default.",
+            color=COLORS["dim"],
+            size=8,
+        )
+        semi_note.setWordWrap(True)
+        semi_note.setContentsMargins(20, 0, 0, 0)
+        layout.addWidget(semi_note)
+
+        layout.addWidget(_separator())
         modality_row = QHBoxLayout()
         modality_row.addWidget(_label("Open cases on:", color=COLORS["dim"], size=9))
         self.modality_combo = QComboBox()
@@ -1509,6 +1584,7 @@ class SettingsDialog(QDialog):
             lesion_fov_mm=float(self.fov_spin.value()),
             save_advances=self.advance_cb.isChecked(),
             keep_tool_on_switch=self.keep_tool_cb.isChecked(),
+            semi_automatic=self.semi_auto_cb.isChecked(),
             default_modality=str(self.modality_combo.currentData() or "swi"),
             orientation=str(self.orientation_combo.currentData() or DEFAULT_ORIENTATION),
             prefetch=self.prefetch_cb.isChecked(),
@@ -1585,6 +1661,243 @@ class DatabaseWriter(QThread):
                 work()
             except Exception as exc:
                 self.failed.emit(f"{description}: {type(exc).__name__}: {exc}")
+
+
+class HubSync(QThread):
+    """Keeps this PC and the shared folder in step, off the GUI thread.
+
+    Three jobs on one thread, so they never race each other: publish this
+    reader's work shortly after each save (several saves in a row become one
+    publish), import other readers whose work changed every ``pull_seconds``,
+    and renew this PC's claim on the reader every ``heartbeat_seconds``.  The
+    shared folder going away is an expected state, reported and retried, not
+    an error: the reader's work is safe in the local store meanwhile.
+    """
+
+    status = Signal(str, str)
+    othersChanged = Signal(list)
+    lockLost = Signal(str)
+
+    def __init__(
+        self,
+        workspace: "hub_store.Workspace",
+        token: str | None,
+        parent: QObject | None = None,
+        *,
+        pull_seconds: float = 20.0,
+        retry_seconds: float = 30.0,
+        heartbeat_seconds: float = float(hub_store.HEARTBEAT_SECONDS),
+        debounce_seconds: float = 1.5,
+    ) -> None:
+        super().__init__(parent)
+        self.workspace = workspace
+        self.token = token
+        self.pull_seconds = float(pull_seconds)
+        self.retry_seconds = float(retry_seconds)
+        self.heartbeat_seconds = float(heartbeat_seconds)
+        self.debounce_seconds = float(debounce_seconds)
+        self._wake = threading.Event()
+        self._stopping = threading.Event()
+        self._lock = threading.Lock()
+        self._publish_at: float | None = None
+        self._pull_now = True
+        self._lost = False
+        self.last_synced: str | None = None
+        self.reader_count = 0
+        self.flushed = True
+
+    @property
+    def read_only(self) -> bool:
+        return self.workspace.read_only or self._lost
+
+    # -------------------------------------------------- called from the GUI --
+    def note_write(self) -> None:
+        """The write listener: remember there is work to publish, and publish soon."""
+
+        if self.read_only:
+            return
+        try:
+            hub_store.mark_dirty(self.workspace)
+        except Exception:
+            pass
+        self.request_publish()
+
+    def request_publish(self) -> None:
+        with self._lock:
+            due = time.monotonic() + self.debounce_seconds
+            self._publish_at = due if self._publish_at is None else min(self._publish_at, due)
+        self._wake.set()
+
+    def request_pull(self) -> None:
+        self._pull_now = True
+        self._wake.set()
+
+    def stop_and_flush(self, timeout_s: float = 8.0) -> bool:
+        """Publish what is left, give the reader back, and end.  True when nothing is left."""
+
+        if self.isRunning():
+            self._stopping.set()
+            self._wake.set()
+            if not self.wait(int(timeout_s * 1000)):
+                # Still copying.  The copy lands whole or not at all, and
+                # anything left is sent at the next start -- but the reader
+                # must not be told it has already gone.
+                return False
+        else:
+            self._finish()
+        return self.flushed
+
+    # ----------------------------------------------------------- the thread --
+    def run(self) -> None:
+        set_busy_timeout_ms(BACKGROUND_BUSY_TIMEOUT_MS * 3)
+        try:
+            if not self.read_only and hub_store.is_dirty(self.workspace):
+                # Work that could not be published last time goes first.
+                self._publish_at = time.monotonic()
+        except Exception:
+            pass
+        next_pull = 0.0
+        next_beat = time.monotonic() + self.heartbeat_seconds
+        while not self._stopping.is_set():
+            now = time.monotonic()
+            with self._lock:
+                due = self._publish_at is not None and now >= self._publish_at
+            if due and not self.read_only:
+                self._publish()
+            if self._pull_now or now >= next_pull:
+                self._pull_now = False
+                self._pull()
+                next_pull = time.monotonic() + self.pull_seconds
+            if self.token and not self._lost and now >= next_beat:
+                self._heartbeat()
+                next_beat = time.monotonic() + self.heartbeat_seconds
+            self._wake.wait(0.25)
+            self._wake.clear()
+        self._finish()
+
+    def _finish(self) -> None:
+        if not self.read_only:
+            try:
+                if hub_store.is_dirty(self.workspace):
+                    self._publish()
+                self.flushed = not hub_store.is_dirty(self.workspace)
+            except Exception:
+                self.flushed = False
+        if self.token and not self._lost:
+            try:
+                hub_store.release_lock(self.workspace.hub, str(self.workspace.reader_id), self.token)
+            except Exception:
+                pass
+
+    def _synced_text(self) -> str:
+        readers = _human_count(self.reader_count, "reader") if self.reader_count else "no other readers yet"
+        return f"Synced {self.last_synced} · {readers}"
+
+    def _publish(self) -> None:
+        with self._lock:
+            self._publish_at = None
+        self.status.emit("syncing", "Syncing…")
+        try:
+            hub_store.publish(self.workspace)
+        except hub_store.HubUnavailable:
+            with self._lock:
+                self._publish_at = time.monotonic() + self.retry_seconds
+            self.status.emit("offline", "Shared folder offline · your work is saved here and will be sent")
+            return
+        except Exception as exc:
+            with self._lock:
+                self._publish_at = time.monotonic() + self.retry_seconds
+            self.status.emit("error", f"Could not publish · {type(exc).__name__}: {exc}")
+            return
+        self.last_synced = datetime.now().strftime("%H:%M")
+        self.status.emit("synced", self._synced_text())
+
+    def _pull(self) -> None:
+        try:
+            changed = hub_store.pull_others(self.workspace)
+            self.reader_count = sum(
+                1
+                for entry in hub_store.list_readers(self.workspace.hub)
+                if entry["reader_id"] != self.workspace.reader_id and entry.get("state")
+            )
+        except hub_store.HubUnavailable:
+            self.status.emit("offline", "Shared folder offline · showing other readers as last seen")
+            return
+        except Exception as exc:
+            self.status.emit("error", f"Could not read other readers · {type(exc).__name__}: {exc}")
+            return
+        self.last_synced = datetime.now().strftime("%H:%M")
+        if self.workspace.last_pull_errors:
+            names = ", ".join(sorted(self.workspace.last_pull_errors))
+            self.status.emit("error", f"Synced {self.last_synced} · could not read {names}")
+        elif self.read_only and self.workspace.read_only:
+            self.status.emit("readonly", f"Read-only · {self._synced_text()}")
+        else:
+            with self._lock:
+                publishing = self._publish_at is not None
+            if not publishing:
+                self.status.emit("synced", self._synced_text())
+        if changed:
+            self.othersChanged.emit(list(changed))
+
+    def _heartbeat(self) -> None:
+        reader = str(self.workspace.reader_id)
+        try:
+            kept = hub_store.heartbeat(self.workspace.hub, reader, str(self.token))
+        except hub_store.HubUnavailable:
+            return
+        except Exception:
+            return
+        if not kept:
+            self._lost = True
+            holder = hub_store.read_lock(self.workspace.hub, reader) or {}
+            self.lockLost.emit(
+                f"{reader} was opened on {holder.get('machine') or 'another PC'}, "
+                "so this window can no longer save."
+            )
+
+
+def choose_session(
+    parent: QWidget | None,
+    db_path: Path,
+    reader: str,
+    settings: "ViewerSettings | None",
+) -> dict[str, Any] | None:
+    """Open one of this reader's rounds, or a first one.  None if they cancelled."""
+
+    rounds = list_reader_rounds(db_path, reader)
+    resumed = False
+    if rounds:
+        preferred = settings.last_round(db_path, reader) if settings else None
+        if preferred is None:
+            preferred = int(rounds[0]["review_round"])
+        chooser = RoundDialog(reader, rounds, preferred_round=preferred, parent=parent)
+        if chooser.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if chooser.start_new:
+            session = start_new_session(db_path, reader, str(rounds[0].get("session_id") or ""))
+        elif chooser.chosen_session_id:
+            session = resume_session(db_path, chooser.chosen_session_id)
+            resumed = True
+        else:
+            return None
+    else:
+        session = start_new_session(db_path, reader)
+    if settings is not None:
+        settings.set_last_round(db_path, reader, int(session["review_round"]))
+    # No background writer exists yet; this one write is not on a hot path.
+    try:
+        log_event(
+            db_path,
+            "session_opened",
+            session_id=session["session_id"],
+            reader_id=reader,
+            review_round=int(session["review_round"]),
+            details={"resumed": resumed},
+        )
+    except Exception:
+        pass
+    return session
 
 
 class VolumeCache:
@@ -1962,6 +2275,8 @@ class DatasetDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.dataset: Dataset | None = None
+        # Set instead of ``dataset`` when the reader picks a shared folder.
+        self.hub_root: Path | None = None
         self.config = dataset_config.validate(config or dataset_config.load())
         self.setWindowTitle("Microbleed Review · Dataset")
         self.setMinimumWidth(640)
@@ -2027,9 +2342,31 @@ class DatasetDialog(QDialog):
             QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Open).setText("Open dataset")
+        shared = buttons.addButton("Use a shared folder…", QDialogButtonBox.ButtonRole.ActionRole)
+        shared.setToolTip(
+            "Open a review folder on the lab NAS that several readers share. "
+            "Each reader signs in with a password."
+        )
+        shared.clicked.connect(self._use_shared_folder)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _ask_for_hub_folder(self) -> str:
+        return QFileDialog.getExistingDirectory(self, "Shared review folder")
+
+    def _use_shared_folder(self) -> None:
+        chosen = self._ask_for_hub_folder()
+        if not chosen:
+            return
+        if not hub_store.is_hub(chosen):
+            self.problem_label.setText(
+                f"{chosen} is not a shared review folder (it has no {hub_store.HUB_FILE}). "
+                "The person who set up the study creates one with tools/hub_admin.py init."
+            )
+            return
+        self.hub_root = Path(chosen)
+        self.accept()
 
     def _build_format_section(self):
         """How to read this dataset: the sheet, and what the files are called.
@@ -2253,6 +2590,10 @@ class SliceCanvas(QWidget):
         # here.  Read only; nothing in the canvas ever writes to it.
         self._external_volume: np.ndarray | None = None
         self._external_compare = False
+        # A mask that has been proposed and not yet accepted.  Deliberately
+        # not the label volume: until a reader says yes it is not their work,
+        # and a click meant to look somewhere else must not leave one behind.
+        self._preview_mask: np.ndarray | None = None
         self._label_value = 1
         self._show_labels = True
         # Outline rather than fill: a 40% wash over a 3 mm lesion at lesion
@@ -2635,6 +2976,21 @@ class SliceCanvas(QWidget):
         self._show_labels = bool(visible)
         self.update()
 
+    def set_preview_mask(self, mask: np.ndarray | None) -> None:
+        """A proposed mask, drawn as a proposal rather than as a mask."""
+
+        self._preview_mask = mask
+        self.update()
+
+    def preview_visible(self) -> bool:
+        """Whether the proposal is drawn: it hides with the segmentation.
+
+        A reader judging whether there is a lesion at all has to be able to
+        look at the image without an outline on it.
+        """
+
+        return self._preview_mask is not None and self._show_labels
+
     def set_external_overlay(self, mask: np.ndarray | None, *, compare: bool = False) -> None:
         """A boolean volume from somewhere else, on this case's grid.
 
@@ -2750,6 +3106,37 @@ class SliceCanvas(QWidget):
         patch[target] = 0 if erase else self._label_value
         self.update()
         return True
+
+    def _preview_slice(self) -> np.ndarray | None:
+        if self._preview_mask is None:
+            return None
+        index = int(np.clip(self._slice_index, 0, self._preview_mask.shape[self.slice_axis] - 1))
+        return extract_plane(self._preview_mask, self.plane, index)[0]
+
+    def _draw_preview_overlay(self, painter: QPainter, rect: QRectF) -> None:
+        """Always an outline, always cyan.
+
+        Never filled, whatever the outline preference says: the reader is
+        being asked whether the boundary is right, and a wash covers the
+        signal that answers it.  The colour is the one nothing else uses, so
+        "proposed" is never confused with "mine", "theirs" or "agreed".
+        """
+
+        preview = self._preview_slice()
+        if preview is None:
+            return
+        preview = np.asarray(preview, dtype=bool)
+        if not preview.any():
+            return
+        edge = self._edge_of(preview)
+        height, width = preview.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        colour = QColor(COLORS["preview"])
+        rgba[edge] = (colour.blue(), colour.green(), colour.red(), 245)
+        image = QImage(
+            rgba.data, int(width), int(height), int(rgba.strides[0]), QImage.Format.Format_ARGB32
+        ).copy()
+        painter.drawPixmap(rect.toRect(), QPixmap.fromImage(image))
 
     def _external_slice(self) -> np.ndarray | None:
         if self._external_volume is None:
@@ -3296,6 +3683,8 @@ class SliceCanvas(QWidget):
             self._draw_label_overlay(painter, rect)
         if self._external_volume is not None:
             self._draw_external_overlay(painter, rect)
+        if self.preview_visible():
+            self._draw_preview_overlay(painter, rect)
 
         # Thin frame makes the actual image bounds clear when zoomed out.
         painter.setPen(QPen(QColor("#525b6b"), 1))
@@ -3727,6 +4116,7 @@ class RoundDialog(QDialog):
         *,
         preferred_round: int | None = None,
         parent: QWidget | None = None,
+        allow_new: bool = True,
     ) -> None:
         super().__init__(parent)
         self.rounds = list(rounds)
@@ -3774,10 +4164,11 @@ class RoundDialog(QDialog):
                 f"Last opened {entry.get('last_seen_at') or 'unknown'}"
             )
             self.list.addItem(item)
-        new_item = QListWidgetItem(f"Start a new round  (round {next_round})")
-        new_item.setData(Qt.ItemDataRole.UserRole, "new")
-        new_item.setForeground(QColor(COLORS["accent"]))
-        self.list.addItem(new_item)
+        if allow_new:
+            new_item = QListWidgetItem(f"Start a new round  (round {next_round})")
+            new_item.setData(Qt.ItemDataRole.UserRole, "new")
+            new_item.setForeground(QColor(COLORS["accent"]))
+            self.list.addItem(new_item)
 
         # Default to the round this reader used last time, if it still exists.
         row = next(
@@ -3889,40 +4280,410 @@ class ReaderDialog(QDialog):
         if not reader:
             QMessageBox.warning(self, "Reader required", "Please enter a reader name before opening the viewer.")
             return
-        rounds = list_reader_rounds(self.db_path, reader)
-        if rounds:
-            preferred = self.settings.last_round(self.db_path, reader) if self.settings else None
-            if preferred is None:
-                preferred = int(rounds[0]["review_round"])
-            chooser = RoundDialog(reader, rounds, preferred_round=preferred, parent=self)
-            if chooser.exec() != QDialog.DialogCode.Accepted:
-                return
-            if chooser.start_new:
-                session = start_new_session(self.db_path, reader, str(rounds[0].get("session_id") or ""))
-            elif chooser.chosen_session_id:
-                session = resume_session(self.db_path, chooser.chosen_session_id)
-            else:
-                return
-        else:
-            session = start_new_session(self.db_path, reader)
+        session = choose_session(self, self.db_path, reader, self.settings)
+        if session is None:
+            return
         self.reader_id = reader
         self.session = session
-        if self.settings is not None:
-            self.settings.set_last_round(self.db_path, reader, int(session["review_round"]))
-        # The dialog has no background writer; this one write happens before
-        # the window exists and is not on a hot path.
-        try:
-            log_event(
-                self.db_path,
-                "session_opened",
-                session_id=session["session_id"],
-                reader_id=reader,
-                review_round=int(session["review_round"]),
-                details={"resumed": bool(candidate and session["review_round"] == candidate["review_round"])},
-            )
-        except Exception:
-            pass
         self.accept()
+
+
+READ_ONLY_SESSION: dict[str, Any] = {"session_id": "", "reader_id": "", "review_round": 0}
+
+
+def view_session(
+    parent: QWidget | None,
+    db_path: Path,
+    reader: str,
+) -> dict[str, Any] | None:
+    """A read-only look at one of this reader's rounds.
+
+    Nothing is written: no session row, no log line.  None when the reader
+    has no round to look at, or the choice was cancelled.
+    """
+
+    rounds = list_reader_rounds(db_path, reader)
+    if not rounds:
+        return None
+    if len(rounds) == 1:
+        entry = rounds[0]
+    else:
+        chooser = RoundDialog(reader, rounds, parent=parent, allow_new=False)
+        chooser.setWindowTitle("Microbleed Review · Look at a round")
+        if chooser.exec() != QDialog.DialogCode.Accepted or chooser.chosen_round is None:
+            return None
+        entry = next(item for item in rounds if int(item["review_round"]) == chooser.chosen_round)
+    return {
+        "session_id": "",
+        "reader_id": reader,
+        "review_round": int(entry["review_round"]),
+        # Opens where they last were, so the view starts on their work.
+        "last_case_id": entry.get("last_case_id"),
+        "last_target_id": entry.get("last_target_id"),
+    }
+MIN_PASSWORD_LENGTH = 4
+
+
+class HubLoginDialog(QDialog):
+    """Who is reading, from a shared folder: pick a reader and prove it.
+
+    Asked every time the viewer opens -- lab PCs are shared, so nothing here
+    remembers a password.  Without one the folder can still be browsed,
+    read-only.
+    """
+
+    NEW_READER = "\u0000new"
+
+    def __init__(
+        self,
+        shared: "hub_store.Hub",
+        parent: QWidget | None = None,
+        *,
+        settings: "ViewerSettings | None" = None,
+        initial_reader: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.shared = shared
+        self.settings = settings
+        self.workspace: "hub_store.Workspace | None" = None
+        self.session: dict[str, Any] | None = None
+        self.token: str | None = None
+        self.read_only = False
+        self.reader_id = ""
+        self.setWindowTitle("Microbleed Review · Review session")
+        self.setMinimumWidth(470)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(_label("Review session", color=COLORS["accent"], bold=True, size=15))
+        where = _label(f"Shared folder: {shared.root}", color=COLORS["dim"], size=9)
+        where.setWordWrap(True)
+        layout.addWidget(where)
+
+        self.form = QFormLayout()
+        self.reader_combo = QComboBox()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("your name, as it should appear in the results")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.form.addRow("Reader:", self.reader_combo)
+        self.form.addRow("Name:", self.name_edit)
+        self.form.addRow("Password:", self.password_edit)
+        self.form.addRow("Repeat:", self.confirm_edit)
+        layout.addLayout(self.form)
+        self.hint_label = _label("", color=COLORS["dim"], size=9)
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+        self.error_label = _label("", color=COLORS["warn"], size=9)
+        self.error_label.setWordWrap(True)
+        self.error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Open review")
+        browse = buttons.addButton("Browse read-only", QDialogButtonBox.ButtonRole.ActionRole)
+        browse.setToolTip("Look at everybody's work without signing in; nothing can be saved")
+        browse.clicked.connect(self._browse_read_only)
+        buttons.accepted.connect(self._open_review)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.password_edit.returnPressed.connect(self._open_review)
+        self.confirm_edit.returnPressed.connect(self._open_review)
+
+        self._fill_readers(initial_reader)
+        self.reader_combo.currentIndexChanged.connect(lambda _index: self._on_reader_changed())
+        self._on_reader_changed()
+
+    # --------------------------------------------------------------- state --
+    def _fill_readers(self, initial: str) -> None:
+        self.reader_combo.clear()
+        try:
+            readers = hub_store.list_readers(self.shared)
+        except hub_store.HubError as exc:
+            readers = []
+            self.error_label.setText(str(exc))
+        for entry in readers:
+            self.reader_combo.addItem(str(entry["reader_id"]), str(entry["reader_id"]))
+        self.reader_combo.addItem("New reader…", self.NEW_READER)
+        index = self.reader_combo.findData(initial) if initial else -1
+        self.reader_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def select_reader(self, reader_id: str) -> None:
+        index = self.reader_combo.findData(reader_id)
+        if index >= 0:
+            self.reader_combo.setCurrentIndex(index)
+        self._on_reader_changed()
+
+    def select_new_reader(self) -> None:
+        self.reader_combo.setCurrentIndex(self.reader_combo.findData(self.NEW_READER))
+        self._on_reader_changed()
+
+    def _is_new(self) -> bool:
+        return self.reader_combo.currentData() == self.NEW_READER
+
+    def _needs_new_password(self) -> bool:
+        if self._is_new():
+            return True
+        try:
+            return not hub_store.has_password(self.shared, str(self.reader_combo.currentData()))
+        except hub_store.HubError:
+            return False
+
+    def _set_row_visible(self, field: QWidget, visible: bool) -> None:
+        field.setVisible(visible)
+        label = self.form.labelForField(field)
+        if label is not None:
+            label.setVisible(visible)
+
+    def _on_reader_changed(self) -> None:
+        new = self._is_new()
+        choosing = self._needs_new_password()
+        self._set_row_visible(self.name_edit, new)
+        self._set_row_visible(self.confirm_edit, choosing)
+        self.error_label.setText("")
+        if new:
+            self.hint_label.setText(
+                "A new reader chooses a password now. It is asked every time this reader "
+                "opens the viewer, on any PC."
+            )
+        elif choosing:
+            self.hint_label.setText(
+                f"{self.reader_combo.currentText()} has no password yet. Choose one now; "
+                "it will be asked every time."
+            )
+        else:
+            self.hint_label.setText("Enter this reader’s password to review and save.")
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """Grow to what is shown now.
+
+        A dialog keeps its size when its contents get taller, and the layout
+        makes room by squeezing the input fields -- which is what an error
+        under them used to do.  Wrapped text needs more height the narrower
+        it is, so the height is asked for at the current width.
+        """
+
+        layout = self.layout()
+        layout.activate()
+        width = self.width()
+        if layout.hasHeightForWidth():
+            needed = layout.totalHeightForWidth(width)
+        else:
+            needed = layout.totalSizeHint().height()
+        if needed > self.height():
+            self.resize(width, needed)
+
+    # ------------------------------------------------------------ actions --
+    def _fail(self, message: str) -> None:
+        # A path has no spaces for a label to wrap at, so a long one was cut
+        # off mid-name -- exactly the part that says what is missing.  Allow a
+        # break after each separator, and keep the exact text to copy.
+        self.error_label.setText(message.replace("\\", "\\\u200b"))
+        self.error_label.setToolTip(message)
+        self._fit_height()
+
+    def _open_review(self) -> None:
+        self.error_label.setText("")
+        password = self.password_edit.text()
+        try:
+            if self._needs_new_password():
+                if len(password) < MIN_PASSWORD_LENGTH:
+                    self._fail(f"Choose a password of at least {MIN_PASSWORD_LENGTH} characters.")
+                    return
+                if password != self.confirm_edit.text():
+                    self._fail("The two passwords do not match.")
+                    return
+                if self._is_new():
+                    name = self.name_edit.text().strip()
+                    if not name:
+                        self._fail("Enter the new reader’s name.")
+                        return
+                    reader = str(hub_store.create_reader(self.shared, name, password)["reader_id"])
+                else:
+                    reader = str(self.reader_combo.currentData())
+                    hub_store.set_password(self.shared, reader, password)
+            else:
+                reader = str(self.reader_combo.currentData())
+                if not hub_store.verify_reader(self.shared, reader, password):
+                    self._fail("Wrong password for this reader.")
+                    self.password_edit.selectAll()
+                    return
+            claim = self._claim(reader)
+        except hub_store.HubUnavailable as exc:
+            self._fail(f"{exc}\nCheck that this PC is connected to the NAS.")
+            return
+        except hub_store.HubError as exc:
+            self._fail(str(exc))
+            return
+        if claim is None:
+            return
+        if claim == "readonly":
+            self._finish(None, None, view=reader)
+        else:
+            self._finish(reader, claim)
+
+    def _claim(self, reader: str) -> str | None:
+        machine = hub_store.machine_name()
+        try:
+            return hub_store.acquire_lock(self.shared, reader, machine=machine)
+        except hub_store.LockHeld as exc:
+            stale = not hub_store.lock_is_fresh(exc.holder)
+            choice = self._ask_about_lock(exc.holder, stale)
+            if choice == "takeover" and stale:
+                return hub_store.acquire_lock(self.shared, reader, machine=machine, force=True)
+            if choice == "readonly":
+                return "readonly"
+            return None
+
+    def _ask_about_lock(self, holder: dict[str, Any], stale: bool) -> str:
+        """``"takeover"``, ``"readonly"`` or ``"cancel"``."""
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reader already open")
+        machine = holder.get("machine") or "another PC"
+        if stale:
+            box.setText(
+                f"This reader was open on {machine}, which has not been heard from for "
+                "several minutes — it may have crashed or been switched off.\n\n"
+                "Take over here? Anything that PC did not publish stays on that PC."
+            )
+            take = box.addButton("Take over", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setText(
+                f"This reader is open on {machine} right now. Two PCs saving as one reader "
+                "would overwrite each other, so here you can only look."
+            )
+            take = None
+        look = box.addButton("Open read-only", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if take is not None and clicked is take:
+            return "takeover"
+        if clicked is look:
+            return "readonly"
+        return "cancel"
+
+    def _browse_read_only(self) -> None:
+        if self._is_new():
+            self._fail("Pick the reader whose work you want to look at.")
+            return
+        self._finish(None, None, view=str(self.reader_combo.currentData()))
+
+    def _finish(self, reader: str | None, token: str | None, *, view: str | None = None) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            try:
+                workspace = hub_store.prepare_workspace(self.shared, reader)
+                restored = hub_store.restore_own(workspace) if reader else {"backup": None}
+            except (hub_store.HubError, SourceReadError) as exc:
+                if token and reader:
+                    hub_store.release_lock(self.shared, reader, token)
+                self._fail(str(exc))
+                return
+            set_write_guard(reader)
+            try:
+                hub_store.pull_others(workspace)
+            except hub_store.HubError:
+                pass  # the window's sync will keep trying
+        finally:
+            QApplication.restoreOverrideCursor()
+        if restored.get("backup"):
+            QMessageBox.information(
+                self,
+                "Newer work found in the shared folder",
+                "This reader has newer work in the shared folder than on this PC, and this "
+                "PC also had changes it never managed to send. The shared version is used; "
+                f"this PC's version is kept at\n{restored['backup']}",
+            )
+        if reader:
+            session = choose_session(self, workspace.work_db, reader, self.settings)
+            if session is None:
+                if token:
+                    hub_store.release_lock(self.shared, reader, token)
+                return
+        else:
+            session = view_session(self, workspace.work_db, view) if view else dict(READ_ONLY_SESSION)
+            if session is None:
+                if not list_reader_rounds(workspace.work_db, str(view)):
+                    self._fail(f"{view} has not saved any work in the shared folder yet.")
+                return
+        self.workspace = workspace
+        self.session = session
+        self.token = token
+        self.read_only = reader is None
+        self.reader_id = reader or ""
+        self.accept()
+
+
+class NoVerdictDialog(QDialog):
+    """What N records: how sure, what it is instead, and why.
+
+    "No" is one read in twelve here, and the one the training data needs a
+    reason for -- "what else" was filled in on 3 of 21 manual noes.  Enter
+    accepts; Escape goes back without saving anything.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        certainty: str = "definite",
+        mimic: str = "",
+        comment: str = "",
+        has_mask: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Not a microbleed")
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        form = QFormLayout()
+        self.certainty_combo = QComboBox()
+        for value in CERTAINTY_CHOICES:
+            self.certainty_combo.addItem(value.capitalize(), value)
+        index = self.certainty_combo.findData(certainty or "definite")
+        self.certainty_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.mimic_combo = QComboBox()
+        self.mimic_combo.addItem("(not said)", "")
+        for value in MIMIC_CHOICES:
+            self.mimic_combo.addItem(value.capitalize(), value)
+        index = self.mimic_combo.findData(mimic or "")
+        self.mimic_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.comment_edit = QLineEdit(comment.strip())
+        self.comment_edit.setPlaceholderText("optional")
+        form.addRow("How sure:", self.certainty_combo)
+        form.addRow("It is instead:", self.mimic_combo)
+        form.addRow("Comment:", self.comment_edit)
+        layout.addLayout(form)
+        if has_mask:
+            note = _label(
+                "Your mask on this finding will be removed (Ctrl+Z brings it back until "
+                "you leave the case).",
+                color=COLORS["warn"],
+                size=9,
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Save as not a microbleed")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.mimic_combo.setFocus()
+
+    def details(self) -> dict[str, str]:
+        return {
+            "certainty": str(self.certainty_combo.currentData() or "definite"),
+            "mimic": str(self.mimic_combo.currentData() or ""),
+            "comment": self.comment_edit.text().strip(),
+        }
 
 
 class LesionCanvas(QWidget):
@@ -4433,8 +5194,16 @@ class MicrobleedViewer(QMainWindow):
         *,
         settings: ViewerSettings | None = None,
         dataset: Dataset | None = None,
+        hub_sync: HubSync | None = None,
+        read_only: bool = False,
     ) -> None:
         super().__init__(parent)
+        # A shared folder: its sync, and whether this window may save at all.
+        self._hub_sync = hub_sync
+        self.read_only = bool(read_only)
+        # Set when the reader chose to sign in as somebody else; whoever
+        # opened the window opens the sign-in again once it has closed.
+        self.sign_in_again = False
         self.db_path = Path(db_path)
         self.data_root = Path(data_root)
         self.settings = settings or ViewerSettings()
@@ -4445,7 +5214,7 @@ class MicrobleedViewer(QMainWindow):
         self.reader_id = str(session["reader_id"])
         self.review_round = int(session["review_round"])
         self.session_id = str(session["session_id"])
-        self.setWindowTitle(f"{APP_TITLE} · {self.reader_id} · round {self.review_round}")
+        self.setWindowTitle(self._window_title())
         # The window carries the icon itself, so it is right even when the
         # viewer is constructed directly rather than through ``main``.
         window_icon = icon_file()
@@ -4495,6 +5264,20 @@ class MicrobleedViewer(QMainWindow):
         self.external_blobs: list[dict[str, Any]] = []
         self._external_3d = False
         self._external_3d_cache: tuple[Any, Any] | None = None
+        # The proposed mask of semi-automatic mode, and where it was grown
+        # from.  Nothing here is in the label volume: until the reader
+        # accepts it, it is not their segmentation.
+        # Which masks were accepted as proposed, and which were then
+        # painted over.  Recorded so the question "did semi-automatic masks
+        # come out different from hand-made ones" stays answerable later,
+        # rather than the mode being invisible in the results.
+        self._semi_auto_masks: set[str] = set()
+        self._semi_auto_edited: set[str] = set()
+        self.preview_mask: np.ndarray | None = None
+        self.preview_details: dict[str, Any] | None = None
+        self.preview_snapped_mm = 0.0
+        self.preview_ras: tuple[float, float, float] | None = None
+        self.preview_modality: str | None = None
         self.label_values: dict[str, int] = {}
         self.label_sources: dict[str, str | None] = {}
         # How each finding's mask was made, and under what settings, so the
@@ -4538,6 +5321,8 @@ class MicrobleedViewer(QMainWindow):
         self._updating_form = False
         self._review_dirty = False
         self._closing = False
+        # The saved slice positions of a resumed session are used once.
+        self._resume_position_used = False
         self._verdict: int | None = None
         self.active_tool: str | None = None
         self._active_plane = "axial"
@@ -4579,6 +5364,8 @@ class MicrobleedViewer(QMainWindow):
         # Before the queue is built: whether a case has model output decides
         # how its row reads.
         self._apply_developer_mode()
+        self._apply_semi_automatic()
+        self._connect_hub()
         self._reload_case_list()
         self._set_status("Select a case from the queue.")
 
@@ -4944,7 +5731,9 @@ class MicrobleedViewer(QMainWindow):
         # Which recorded position of this finding is being shown. Saving
         # records the position that is selected here, so adopting another
         # reader's correction is simply a matter of looking at it.
-        position_row = QHBoxLayout()
+        self.position_row_widget = QWidget()
+        position_row = QHBoxLayout(self.position_row_widget)
+        position_row.setContentsMargins(0, 0, 0, 0)
         position_row.setSpacing(6)
         position_row.addWidget(_section_title("Position"))
         self.position_combo = QComboBox()
@@ -4964,7 +5753,7 @@ class MicrobleedViewer(QMainWindow):
         )
         self.move_here_btn.clicked.connect(lambda _checked=False: self.move_finding_here())
         position_row.addWidget(self.move_here_btn)
-        layout.addLayout(position_row)
+        layout.addWidget(self.position_row_widget)
         layout.addWidget(_separator())
 
         # The shortcut is part of the label: it is the fastest way to teach the
@@ -5020,7 +5809,13 @@ class MicrobleedViewer(QMainWindow):
         detail_row.addWidget(self.mimic_combo, 1)
         layout.addLayout(detail_row)
 
-        self.comment_edit = QTextEdit()
+        # Where the segmentation controls are inserted in semi-automatic
+        # mode: under the verdict, above the comment, which is the order the
+        # work happens in.
+        self.review_layout = layout
+        self._segment_slot = layout.count()
+
+        self.comment_edit = CommentEdit()
         self.comment_edit.setPlaceholderText("Comment (optional)…")
         self.comment_edit.setMinimumHeight(40)
         self.comment_edit.setMaximumHeight(50)
@@ -5087,9 +5882,17 @@ class MicrobleedViewer(QMainWindow):
         from the verdict, and the finding list above the tabs never moves.
         """
 
-        layout = self._add_panel_tab(
+        self.segment_tab_layout = self._add_panel_tab(
             "segment", "Segment", "Draw or grow this finding's mask"
         )
+        # A container rather than widgets straight into the tab: in
+        # semi-automatic mode the whole thing moves into Review, and moving
+        # one widget is not the same job as keeping two copies in step.
+        self.segment_panel = QWidget()
+        layout = QVBoxLayout(self.segment_panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.segment_tab_layout.addWidget(self.segment_panel)
 
         # Visible only when something is in the way, and it says which thing.
         # Disabled buttons with no reason beside them are the worst of both.
@@ -5097,6 +5900,14 @@ class MicrobleedViewer(QMainWindow):
         self.segment_block_label.setWordWrap(True)
         self.segment_block_label.setVisible(False)
         layout.addWidget(self.segment_block_label)
+
+        # In semi-automatic mode this is the line the reader reads before
+        # pressing Y, so it sits with the mask controls rather than in the
+        # status bar at the bottom of the window.
+        self.preview_label = _label("", color=COLORS["preview"], size=8)
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setVisible(False)
+        layout.addWidget(self.preview_label)
 
         roi_top = QHBoxLayout()
         roi_top.setSpacing(6)
@@ -5120,7 +5931,9 @@ class MicrobleedViewer(QMainWindow):
         roi_top.addWidget(self.show_roi_cb)
         layout.addLayout(roi_top)
 
-        auto_row = QHBoxLayout()
+        self.auto_row_widget = QWidget()
+        auto_row = QHBoxLayout(self.auto_row_widget)
+        auto_row.setContentsMargins(0, 0, 0, 0)
         auto_row.setSpacing(5)
         self.auto_roi_btn = QPushButton("Generate")
         self.auto_roi_btn.setToolTip(
@@ -5136,7 +5949,7 @@ class MicrobleedViewer(QMainWindow):
         )
         self.grow_stroke_btn.clicked.connect(lambda _checked=False: self.grow_from_stroke())
         auto_row.addWidget(self.grow_stroke_btn)
-        layout.addLayout(auto_row)
+        layout.addWidget(self.auto_row_widget)
 
         # A grid, not two rows of boxes: the spin boxes are capped in width, so
         # a stretch factor could only put the slack *between* them -- which is
@@ -5160,6 +5973,7 @@ class MicrobleedViewer(QMainWindow):
             "How far past the local background a voxel must be to join the mask.\n"
             "Lower includes more; raise it if the mask runs into nearby tissue."
         )
+        self.sensitivity_spin.valueChanged.connect(self._on_grow_parameter_changed)
         self.sensitivity_spin.setMinimumWidth(58)
         self.sensitivity_spin.setMaximumWidth(74)
         fields.addWidget(self.sensitivity_spin, 0, 1)
@@ -5174,11 +5988,13 @@ class MicrobleedViewer(QMainWindow):
         self.roi_radius_spin.setSuffix(" mm")
         self.roi_radius_spin.setValue(6.0)
         self.roi_radius_spin.setToolTip("Growth cannot leave this radius around the finding")
+        self.roi_radius_spin.valueChanged.connect(self._on_grow_parameter_changed)
         self.roi_radius_spin.setMinimumWidth(62)
         self.roi_radius_spin.setMaximumWidth(84)
         fields.addWidget(self.roi_radius_spin, 0, 4)
 
-        fields.addWidget(_label("brush", color=COLORS["faint"], size=8, wrap=False), 1, 0)
+        self.brush_size_label = _label("brush", color=COLORS["faint"], size=8, wrap=False)
+        fields.addWidget(self.brush_size_label, 1, 0)
         self.brush_spin = QDoubleSpinBox()
         self.brush_spin.setRange(0.3, 10.0)
         self.brush_spin.setSingleStep(0.5)
@@ -5225,7 +6041,9 @@ class MicrobleedViewer(QMainWindow):
         self.lesion_3d_btn.clicked.connect(lambda _checked=False: self.open_own_lesion_3d())
         edit_row.addWidget(self.lesion_3d_btn, 1)
         layout.addLayout(edit_row)
-        segment_save_row = QHBoxLayout()
+        self.segment_save_row_widget = QWidget()
+        segment_save_row = QHBoxLayout(self.segment_save_row_widget)
+        segment_save_row.setContentsMargins(0, 0, 0, 0)
         segment_save_row.setSpacing(5)
         self.segment_save_btn = QPushButton("Save")
         self.segment_save_btn.setToolTip("Save the review and this mask, and stay here")
@@ -5245,8 +6063,8 @@ class MicrobleedViewer(QMainWindow):
             lambda _checked=False: self.save_current_review(advance=True)
         )
         segment_save_row.addWidget(self.segment_next_btn, 1)
-        layout.addLayout(segment_save_row)
-        layout.addStretch(1)
+        layout.addWidget(self.segment_save_row_widget)
+        self.segment_tab_layout.addStretch(1)
 
     def _build_external_tab(self) -> None:
         """Somebody else's segmentation of this case, for looking at.
@@ -5375,6 +6193,62 @@ class MicrobleedViewer(QMainWindow):
         layout.addWidget(self.external_blob_list)
 
         layout.addStretch(1)
+
+    def _show_brush_controls(self, visible: bool) -> None:
+        """The brush size and the 3D-brush box, when there is a brush.
+
+        In semi-automatic mode the panel has 282px at the window's minimum
+        size and everything in it has to be visible at once, so a row that
+        does nothing until a tool is picked up waits until it is.
+        """
+
+        for widget in (self.brush_size_label, self.brush_spin, self.brush_3d_cb):
+            widget.setVisible(bool(visible))
+
+    def _apply_semi_automatic(self) -> None:
+        """One panel or two tabs, and which controls make sense in each.
+
+        Measured before merging: Review wants 195px and Segment 190px of a
+        282px panel, so stacking them as they stand would open scrolled.  It
+        fits because semi-automatic mode removes what it makes redundant --
+        Generate and Grow stroke happen by themselves, the Segment tab's own
+        save row is the same row as Review's -- and shrinks the comment box,
+        which is empty on 266 of 277 reviews here, to one line.  What stays is
+        what the recorded work says gets used: sensitivity (tuned on 17% of
+        masks) and max radius (only 27% of masks used the default).
+        """
+
+        on = self.settings.semi_automatic
+        index = self._panel_tab_keys.index("segment")
+        if on:
+            self.review_layout.insertWidget(self._segment_slot, self.segment_panel)
+        else:
+            self.segment_tab_layout.insertWidget(0, self.segment_panel)
+        self.panel_tabs.setTabVisible(index, not on)
+        self.panel_tabs.setTabText(0, "Read" if on else "Review")
+
+        self.auto_row_widget.setVisible(not on)
+        self.segment_save_row_widget.setVisible(not on)
+        self.position_row_widget.setVisible(not on)
+        self._show_brush_controls(not on)
+        self.save_segment_btn.setVisible(not on)
+        # One line rather than three.  Still a comment box; still typeable.
+        # One line at the smallest window, where the panel must still fit
+        # without scrolling; taller wherever the window has room, because one
+        # line was too small to write in.  The box takes the spare height
+        # before the stretch below the buttons does.
+        self.comment_edit.setMinimumHeight(24 if on else 40)
+        self.comment_edit.setMaximumHeight(110 if on else 50)
+        self.review_layout.setStretchFactor(self.comment_edit, 10 if on else 0)
+        self.save_next_btn.setText("Accept  ›" if on else "+ Next  ›")
+        self.save_next_btn.setToolTip(
+            "Accept the position, the proposed mask and the verdict, and move on  (Y, or Ctrl+S)"
+            if on
+            else "Save and move to the next finding, or the next case  (Ctrl+S)"
+        )
+        if on:
+            self.show_panel_tab("review")
+        self._refresh_preview_readout()
 
     def _build_shortcut_section(self) -> QWidget:
         """The key legend, folded away under the reference column.
@@ -5799,8 +6673,8 @@ class MicrobleedViewer(QMainWindow):
         # N/P: during a read, "no" is pressed far more often than "next case".
         callbacks: dict[str, Any] = {
             "save_review": lambda: self.save_current_review(),
-            "verdict_yes": lambda: self.set_verdict(1),
-            "verdict_no": lambda: self.set_verdict(0),
+            "verdict_yes": lambda: self._semi_auto_verdict(1),
+            "verdict_no": lambda: self._semi_auto_verdict(0),
             "verdict_unset": lambda: self.set_verdict(None),
             "prev_finding": lambda: self.step_finding(-1),
             "next_finding": lambda: self.step_finding(1),
@@ -5813,7 +6687,7 @@ class MicrobleedViewer(QMainWindow):
             "overlay_target": lambda: self.target_crosshair_cb.toggle(),
             "overlay_mouse": lambda: self.mouse_crosshair_cb.toggle(),
             "overlay_labels": lambda: self.direction_cb.toggle(),
-            "cancel_pick": self.clear_picked_position,
+            "cancel_pick": self._cancel_pick_or_preview,
             "tool_brush": lambda: self.set_tool(None if self.active_tool == "brush" else "brush"),
             "tool_eraser": lambda: self.set_tool(None if self.active_tool == "eraser" else "eraser"),
             "toggle_roi_overlay": lambda: self.show_roi_cb.toggle(),
@@ -5821,6 +6695,9 @@ class MicrobleedViewer(QMainWindow):
             "brush_smaller": lambda: self.step_brush_radius(-self.brush_spin.singleStep()),
             "brush_larger": lambda: self.step_brush_radius(self.brush_spin.singleStep()),
             "undo_roi": self.undo_roi,
+            "sensitivity_down": lambda: self.step_sensitivity(-1),
+            "sensitivity_up": lambda: self.step_sensitivity(1),
+            "clear_roi": self.clear_roi,
             "lesion_zoom": self.toggle_lesion_focus,
             "contrast_dialog": self.open_contrast_dialog,
             "reset_contrast": self.reset_window_level,
@@ -6176,14 +7053,27 @@ class MicrobleedViewer(QMainWindow):
         return True
 
     def _restore_slice_positions_if_resumed(self, case_id: str) -> None:
-        if case_id != self.session.get("last_case_id"):
+        """Put the views back where the reader left off -- once.
+
+        Only the first time the case is opened after resuming: this used to
+        run on every visit to that case for the whole session, sending the
+        views back to where they were at the start instead of to the finding.
+        """
+
+        if self._resume_position_used or case_id != self.session.get("last_case_id"):
             return
+        self._resume_position_used = True
         saved = {
             "axial": self.session.get("last_axial"),
             "coronal": self.session.get("last_coronal"),
             "sagittal": self.session.get("last_sagittal"),
         }
         if not any(value is not None for value in saved.values()):
+            return
+        # All three at 0 is the corner of the volume, where nobody reads:
+        # it is what an empty view reports, saved by an older version while
+        # the case was still loading.  The finding is the better place.
+        if all(value in (0, None) for value in saved.values()):
             return
         for plane, value in saved.items():
             try:
@@ -6281,6 +7171,10 @@ class MicrobleedViewer(QMainWindow):
             self._load_label_volume()
             self._apply_current_modality()
             self._apply_zoom_preference()
+            # The finding was selected before any of this existed -- the
+            # images and the label volume are only in memory now -- so the
+            # proposal for it has to be made here rather than at selection.
+            self.propose_mask(because="arrived")
             missing = [
                 MODALITY_SHORT_LABELS[modality]
                 for modality in MODALITY_BUTTON_ORDER
@@ -6336,10 +7230,167 @@ class MicrobleedViewer(QMainWindow):
         self.current_modality = fallback
         return wanted
 
+    # ------------------------------------------------------- shared folder --
+    def _window_title(self) -> str:
+        if self.read_only:
+            who = f" · {self.reader_id} · round {self.review_round}" if self.reader_id else ""
+            return f"{APP_TITLE} · READ-ONLY{who}"
+        return f"{APP_TITLE} · {self.reader_id} · round {self.review_round}"
+
+    def _connect_hub(self) -> None:
+        sync = self._hub_sync
+        if sync is None:
+            return
+        self._hub_status_label = _label(
+            "Connecting to the shared folder…", color=COLORS["dim"], size=9, wrap=False
+        )
+        self._status_bar.addPermanentWidget(self._hub_status_label)
+        sync.status.connect(self._on_hub_status)
+        sync.othersChanged.connect(self._refresh_other_readers)
+        sync.lockLost.connect(self._on_lock_lost)
+        if not self.read_only:
+            set_write_listener(sync.note_write)
+        menu = self.more_btn.menu()
+        self.hub_refresh_action = QAction("Refresh from shared folder", self)
+        self.hub_refresh_action.triggered.connect(lambda _checked=False: sync.request_pull())
+        self.hub_export_action = QAction("Export all readers…", self)
+        self.hub_export_action.triggered.connect(lambda _checked=False: self.export_all_readers())
+        menu.insertAction(self.export_action, self.hub_refresh_action)
+        menu.insertAction(self.export_action, self.hub_export_action)
+        # Signing in as somebody else goes through the password, which is
+        # asked when the viewer opens; so does another shared folder.
+        self.dataset_action.setEnabled(False)
+        self.dataset_action.setToolTip("Close and reopen the viewer to open another folder")
+        self.switch_session_btn.setToolTip("Another review round, or sign in as another reader")
+        if self.read_only:
+            self._show_read_only()
+        sync.start()
+
+    def _on_hub_status(self, kind: str, text: str) -> None:
+        color = {
+            "synced": COLORS["success"],
+            "offline": COLORS["warn"],
+            "error": COLORS["warn"],
+        }.get(kind, COLORS["dim"])
+        self._hub_status_label.setText(text)
+        self._hub_status_label.setStyleSheet(f"color:{color}; font-size:9pt;")
+
+    def _show_read_only(self) -> None:
+        self.setWindowTitle(self._window_title())
+        text = (
+            f"{self.reader_id} · round {self.review_round} · read-only"
+            if self.reader_id
+            else "Read-only · all readers"
+        )
+        self.session_label.setText(text)
+        self.session_label.setToolTip("Nothing can be saved in this window.")
+        self.set_tool(None)
+        # Disabled rather than merely refused: a button that looks usable and
+        # then says no is worse than one that says so by its look.
+        for widget in (
+            self.verdict_segments,
+            self.certainty_combo,
+            self.mimic_combo,
+            self.save_review_btn,
+            self.save_segment_btn,
+            self.save_next_btn,
+            self.segment_save_btn,
+            self.segment_next_btn,
+            self.move_here_btn,
+            self.add_manual_btn,
+            self.segment_panel,
+        ):
+            widget.setEnabled(False)
+        self.comment_edit.setReadOnly(True)
+        self._update_segment_availability()
+
+    def _on_lock_lost(self, message: str) -> None:
+        self.read_only = True
+        set_write_guard(None)
+        set_write_listener(None)
+        self._review_dirty = False
+        self._roi_dirty = False
+        self._update_dirty_indicator()
+        self._show_read_only()
+        self._set_status(message, COLORS["warn"])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("This window is now read-only")
+        box.setText(
+            f"{message}\n\nEverything saved before this moment is safe. Close this window, "
+            "or keep it open to look."
+        )
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.open()
+
+    def _refresh_other_readers(self, readers: list | None = None) -> None:
+        """Show other readers' newest work without disturbing this reader's.
+
+        Only what other readers own is redrawn -- their reports, their
+        positions, the queue's progress.  The view, the form being filled in
+        and any mask being drawn stay exactly as they are.
+        """
+
+        if self._loading or self._closing:
+            return
+        if self.current_case_id is not None:
+            fresh = list_targets(self.db_path, self.current_case_id, self.reader_id, self.review_round)
+            selected_id = str(self.selected_target["target_id"]) if self.selected_target else None
+            self.targets = fresh
+            self._populate_target_list()
+            row = next(
+                (index for index, target in enumerate(fresh) if str(target["target_id"]) == selected_id),
+                -1,
+            )
+            if row >= 0:
+                self.target_list.blockSignals(True)
+                self.target_list.setCurrentRow(row)
+                self.target_list.blockSignals(False)
+                self.selected_target = fresh[row]
+                self._show_target_context(self.selected_target)
+                # Other readers' positions may be new; an unsaved move of this
+                # reader's own is carried over by the rebuild.
+                self._rebuild_position_variants(self.selected_target)
+        self._reload_case_list()
+        if readers:
+            self._set_status(f"Updated from {', '.join(str(name) for name in readers)}.", COLORS["dim"])
+
+    def export_all_readers(self, out_path: Path | None = None) -> Path | None:
+        """Everybody's published work in one table, straight from the shared folder."""
+
+        if self._hub_sync is None:
+            return None
+        shared = self._hub_sync.workspace.hub
+        if out_path is None:
+            chosen, _filter = QFileDialog.getSaveFileName(
+                self,
+                "Export all readers",
+                str(shared.exports_dir / f"all_readers_{datetime.now():%Y%m%d}.xlsx"),
+                "Excel workbook (*.xlsx);;CSV (*.csv)",
+            )
+            if not chosen:
+                return None
+            out_path = Path(chosen)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            report = hub_store.export_all(shared, Path(out_path))
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Could not export", f"{type(exc).__name__}: {exc}")
+            return None
+        QApplication.restoreOverrideCursor()
+        self._set_status(
+            f"Exported {_human_count(int(report.get('readers') or 0), 'reader')} to {out_path}",
+            COLORS["success"],
+        )
+        return Path(out_path)
+
     # ------------------------------------------------------- deferred writes --
     def _log_event(self, event_type: str, **kwargs: Any) -> None:
         """Queue an operation-log row; never make the reader wait for it."""
 
+        if self.read_only:
+            return
         db_path = self.db_path
         self._writer.submit(
             f"log {event_type}",
@@ -6658,6 +7709,10 @@ class MicrobleedViewer(QMainWindow):
         self._open_workspace_for(target)
         self._apply_target_to_views(recenter=True)
         self._apply_zoom_preference()
+        # A proposal for a finding nobody has drawn yet, so the common case --
+        # the source position is right and so is the grow -- is one keypress.
+        self._clear_preview()
+        self.propose_mask(because="arrived")
         if not self._report_marker_placement():
             self._set_status(
                 f"{target['label']} · RAS ({ras[0]:.3f}, {ras[1]:.3f}, {ras[2]:.3f})",
@@ -6823,6 +7878,10 @@ class MicrobleedViewer(QMainWindow):
         self._set_manual_spins(values)
         linked = {name for name, panel in self.view_panels.items() if panel.sync_enabled}
         self._apply_target_to_views(recenter=True, planes=linked)
+        if self.semi_automatic() and self.active_tool == "point":
+            # The click that says where the lesion is, is also the click that
+            # says where to grow from.
+            self.propose_mask(because="clicked")
         self._set_status(f"Viewer centered on clicked voxel · RAS ({values[0]:.3f}, {values[1]:.3f}, {values[2]:.3f})", COLORS["accent"])
         self._log_event(
             "viewer_coordinate_clicked",
@@ -7082,6 +8141,18 @@ class MicrobleedViewer(QMainWindow):
 
     # --------------------------------------------------------- segmentation --
     def _label_file(self) -> Path:
+        if self.read_only:
+            # Somebody else's masks are not on this PC; resolve finds them in
+            # the shared folder.
+            return resolve_label_path(
+                self.db_path,
+                {
+                    "path": "",
+                    "case_id": str(self.current_case_id),
+                    "reader_id": self.reader_id,
+                    "review_round": self.review_round,
+                },
+            )
         return label_path(self.db_path, str(self.current_case_id), self.reader_id, self.review_round)
 
     def _label_reference(self) -> Volume | None:
@@ -7279,8 +8350,8 @@ class MicrobleedViewer(QMainWindow):
         current = self.label_methods.get(target_id)
         if current is None:
             self.label_methods[target_id] = "brush"
-        elif current == "grow":
-            self.label_methods[target_id] = "grow+brush"
+        elif current in ("grow", "semiauto"):
+            self.label_methods[target_id] = f"{current}+brush"
 
     def _roi_undo_bytes(self) -> int:
         """How much the undo history costs; asserted on by the tests."""
@@ -7335,7 +8406,24 @@ class MicrobleedViewer(QMainWindow):
         self._update_roi_readout()
         self._set_status("Undid the last brush stroke.", COLORS["dim"])
 
+    def step_sensitivity(self, direction: int) -> None:
+        """One step of the grow sensitivity; a proposal on screen regrows."""
+
+        spin = self.sensitivity_spin
+        spin.setValue(spin.value() + int(direction) * spin.singleStep())
+        self._set_status(
+            f"Sensitivity {spin.value():g} \u00b7 lower grows larger", COLORS["dim"]
+        )
+
     def clear_roi(self) -> None:
+        if self.read_only:
+            self._set_status("Read-only session: nothing can be changed.", COLORS["warn"])
+            return
+        if self.preview_mask is not None:
+            # The proposal is what is on screen, so it is what Clear clears.
+            self._clear_preview()
+            self._set_status("Dropped the proposed mask.", COLORS["dim"])
+            return
         mask = self._selected_label_mask()
         if mask is None or not mask.any():
             self._set_status("This finding has no segmentation.", COLORS["dim"])
@@ -8438,6 +9526,12 @@ class MicrobleedViewer(QMainWindow):
                 radius_mm=(self.label_settings.get(target_id) or {}).get("radius_mm"),
             )
             written[target_id] = count
+            # What the database now holds, so clearing this mask later in the
+            # same visit deletes its row instead of leaving one behind.
+            if count:
+                self._stored_roi_targets.add(target_id)
+            else:
+                self._stored_roi_targets.discard(target_id)
         self._roi_dirty = False
         return written
 
@@ -8452,6 +9546,8 @@ class MicrobleedViewer(QMainWindow):
         travel all the way into the export and the agreement table.
         """
 
+        if self.read_only:
+            return "Read-only session: nothing can be saved in this window."
         if self._grid_problem:
             return self._grid_problem
         if self.selected_target is None:
@@ -8507,6 +9603,8 @@ class MicrobleedViewer(QMainWindow):
             self._set_status(blocked, COLORS["warn"])
             return
         self.active_tool = tool
+        if self.settings.semi_automatic:
+            self._show_brush_controls(tool in ("brush", "eraser"))
         for name, button in self.tool_buttons.items():
             if button.isChecked() != (name == tool):
                 button.setChecked(name == tool)
@@ -8516,8 +9614,15 @@ class MicrobleedViewer(QMainWindow):
                 {"brush": "paint", "eraser": "erase"}.get(tool)
             )
         if tool in ("brush", "eraser"):
+            # Editing a proposal makes it the reader's, so it becomes a real
+            # mask before the first stroke rather than being painted beside.
+            if self.preview_mask is not None:
+                self._commit_preview()
+                if self.selected_target is not None:
+                    self._semi_auto_edited.add(str(self.selected_target["target_id"]))
             # The controls for the tool just picked are one tab away.
-            self.show_panel_tab("segment")
+            if not self.semi_automatic():
+                self.show_panel_tab("segment")
             if not can_segment(self.current_modality):
                 usable = [
                     MODALITY_LABELS[key]
@@ -8606,6 +9711,8 @@ class MicrobleedViewer(QMainWindow):
     def _confirm_unconfirmed_segmentations(self) -> bool:
         """Ask before leaving a case whose masks carry no verdict."""
 
+        if self.read_only:
+            return True
         pending = self.unconfirmed_segmentations()
         if not pending:
             return True
@@ -8672,6 +9779,15 @@ class MicrobleedViewer(QMainWindow):
 
     def toggle_point_tool(self) -> None:
         self.set_tool(None if self.active_tool == "point" else "point")
+
+    def _cancel_pick_or_preview(self) -> None:
+        """Escape drops the proposal first, then the picked position."""
+
+        if self.preview_mask is not None:
+            self._clear_preview()
+            self._set_status("Dropped the proposed mask.", COLORS["dim"])
+            return
+        self.clear_picked_position()
 
     def clear_picked_position(self) -> None:
         """Drop a picked position and put the cursor back on the finding.
@@ -8745,7 +9861,7 @@ class MicrobleedViewer(QMainWindow):
         self.position_combo.setCurrentIndex(index)
         self.position_combo.blockSignals(False)
         self.position_combo.setEnabled(len(self.position_variants) > 1)
-        self.move_here_btn.setEnabled(self.selected_target is not None)
+        self.move_here_btn.setEnabled(self.selected_target is not None and not self.read_only)
         self._update_position_hint()
 
     def _update_position_hint(self) -> None:
@@ -8827,7 +9943,7 @@ class MicrobleedViewer(QMainWindow):
         for panel in self.view_panels.values():
             panel.canvas.set_ghost_voxel(ghost_voxel)
 
-    def move_finding_here(self) -> None:
+    def move_finding_here(self, *, snap: bool = True) -> None:
         """Record the crosshair position as this reader's correction."""
 
         if self.selected_target is None:
@@ -8838,7 +9954,7 @@ class MicrobleedViewer(QMainWindow):
             return
         chosen = tuple(float(value) for value in self.target_ras)
         snapped_by = 0.0
-        if self.settings.snap_to_lesion:
+        if snap and self.settings.snap_to_lesion:
             refined = self._snapped_ras(chosen)
             if refined is not None:
                 snapped_by = _distance_mm(chosen, refined) or 0.0
@@ -9060,6 +10176,7 @@ class MicrobleedViewer(QMainWindow):
     def open_settings(self, *, tab: int = 0) -> None:
         before_orientation = self.settings.orientation
         before_shortcuts = self.settings.shortcuts()
+        before_semi_auto = self.settings.semi_automatic
         dialog = SettingsDialog(self.settings, self)
         tabs = dialog.findChild(QTabWidget)
         if tabs is not None:
@@ -9070,6 +10187,12 @@ class MicrobleedViewer(QMainWindow):
             panel.canvas.set_lesion_fov(self.settings.lesion_fov_mm)
             panel.canvas.set_smooth_zoom(self.settings.smooth_zoom)
         self._update_save_buttons()
+        if self.settings.semi_automatic != before_semi_auto:
+            self._apply_semi_automatic()
+            if self.settings.semi_automatic:
+                self.propose_mask(because="arrived")
+            else:
+                self._clear_preview()
         if self.settings.shortcuts() != before_shortcuts:
             self._bind_shortcuts()
         else:
@@ -9295,15 +10418,63 @@ class MicrobleedViewer(QMainWindow):
         restart.  Nothing is torn down until the new session exists.
         """
 
+        if self._hub_sync is not None:
+            return self._switch_in_shared_folder()
         if not self._confirm_dirty():
             return False
         if not self._confirm_unconfirmed_segmentations():
             return False
         return self.switch_dataset(self.dataset)
 
+    def _switch_in_shared_folder(self) -> bool:
+        """Another round here, or back to the sign-in for another reader.
+
+        A round of the reader already signed in needs no password.  Another
+        reader does, and it is asked at the sign-in -- so that choice closes
+        this window, gives the reader back, and opens the sign-in again.
+        """
+
+        choices = ["reader"] if self.read_only else ["round", "reader"]
+        choice = self._ask_switch_kind(choices)
+        if choice not in choices:
+            return False
+        if not self._confirm_dirty() or not self._confirm_unconfirmed_segmentations():
+            return False
+        if choice == "reader":
+            self.sign_in_again = True
+            self.close()
+            return True
+        session = choose_session(self, self.db_path, self.reader_id, self.settings)
+        if session is None:
+            return False
+        return self.switch_dataset(self.dataset, session)
+
+    def _ask_switch_kind(self, choices: list[str]) -> str | None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Switch")
+        box.setText("Open another review round, or sign in as another reader?")
+        buttons = {}
+        if "round" in choices:
+            buttons[box.addButton("Another round…", QMessageBox.ButtonRole.AcceptRole)] = "round"
+        label = (
+            "Sign in, or look at another reader or round…"
+            if self.read_only
+            else "Sign in as another reader…"
+        )
+        buttons[box.addButton(label, QMessageBox.ButtonRole.ActionRole)] = "reader"
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        return buttons.get(box.clickedButton())
+
     def change_dataset(self) -> bool:
         """Open another study, ending the current review session cleanly."""
 
+        if self._hub_sync is not None:
+            self._set_status(
+                "Close and reopen the viewer to sign in as another reader or open another folder.",
+                COLORS["warn"],
+            )
+            return False
         if not self._confirm_dirty():
             return False
         dialog = DatasetDialog(self.settings, self.dataset, self)
@@ -9375,10 +10546,14 @@ class MicrobleedViewer(QMainWindow):
         self.db_path = Path(dataset.review_db)
         self.data_root = Path(dataset.data_root)
         self.session = dict(session)
+        self._resume_position_used = False
         self.reader_id = str(session["reader_id"])
         self.review_round = int(session["review_round"])
         self.session_id = str(session["session_id"])
-        self.settings.remember_dataset(dataset)
+        if self._hub_sync is None:
+            # In a shared folder the dataset is this PC's working copy, which
+            # must never be offered as a study of its own.
+            self.settings.remember_dataset(dataset)
 
         self._prefetch_timer.stop()
         self._stop_prefetch()
@@ -9397,7 +10572,7 @@ class MicrobleedViewer(QMainWindow):
         self._clear_review_form()
         self._populate_target_list()
         self._set_loading_placeholders()
-        self.setWindowTitle(f"{APP_TITLE} · {self.reader_id} · round {self.review_round}")
+        self.setWindowTitle(self._window_title())
         self.session_label.setText(f"{self.reader_id} · round {self.review_round}")
         self.session_label.setToolTip(
             f"{self.reader_id} · round {self.review_round}\n"
@@ -9515,12 +10690,305 @@ class MicrobleedViewer(QMainWindow):
         self._update_segment_availability()
 
     def _on_verdict_selected(self, key: str) -> None:
+        if self.read_only:
+            # A key press still reaches here; put the display back.
+            self.verdict_segments.set_current_key(self.VERDICT_KEYS[self._verdict])
+            return
         value = 1 if key == "yes" else 0 if key == "no" else None
         if value == self._verdict:
             return
         self._verdict = value
         self._update_segment_availability()
         self._mark_review_dirty()
+
+    # ------------------------------------------------- semi-automatic mode --
+    def semi_automatic(self) -> bool:
+        return bool(self.settings.semi_automatic)
+
+    def _preview_is_possible(self) -> str | None:
+        """Why a mask cannot be proposed here, or None if it can."""
+
+        if not self.semi_automatic():
+            return "not in semi-automatic mode"
+        if self.selected_target is None or self.label_volume is None:
+            return "no finding"
+        blocked = self.segmentation_block()
+        if blocked:
+            return blocked
+        if not can_segment(self.current_modality):
+            return f"{MODALITY_LABELS.get(self.current_modality, 'this sequence')} cannot be segmented"
+        if self.volumes.get(self.current_modality) is None:
+            return "no image"
+        return None
+
+    def _has_own_mask(self) -> bool:
+        if self.label_volume is None or self.selected_target is None:
+            return False
+        value = self.label_values.get(str(self.selected_target["target_id"]))
+        if value is None:
+            return False
+        return bool(np.any(self.label_volume == int(value)))
+
+    def propose_mask(self, *, because: str = "arrived") -> None:
+        """Grow a mask at the current position and offer it.
+
+        Grown into a scratch array rather than the label volume: a click meant
+        to look somewhere else must not leave a mask behind, must not dirty
+        the review, and must not push an undo step.  One grow measured at 33 ms
+        on this data, so this can run on every click without being felt.
+        """
+
+        if self._preview_is_possible() is not None:
+            return
+        # Never over work that already exists.  Re-opening a case would
+        # otherwise offer to overwrite a finished segmentation.
+        if because == "arrived" and self._has_own_mask():
+            self._clear_preview()
+            return
+        volume = self.volumes[self.current_modality]
+        ras = self.target_ras or self.marker_ras
+        if ras is None:
+            return
+        # Onto the focus first.  Accepting runs the position through the same
+        # snap, so growing from the unsnapped point would put the mask on
+        # screen somewhere the recorded coordinate is not -- and measured over
+        # 29 drawn findings it is also much the worse seed: median dice 0.881
+        # from the raw coordinate against 0.977 from the snapped one, and
+        # three collapses to a single voxel against one.
+        snapped_by = 0.0
+        # Only when a finding opens, from the workbook's coordinate: that is
+        # where snapping was measured to help.  A click is the reader saying
+        # where the lesion is -- snapping it walked up to 4 mm, onto another
+        # spot, and grew the mask there.
+        if self.settings.snap_to_lesion and because == "arrived":
+            refined = self._snapped_ras(ras)
+            if refined is not None:
+                snapped_by = _distance_mm(ras, refined) or 0.0
+                if snapped_by > 1e-6:
+                    ras = refined
+                    self.target_ras = ras
+                    self._set_coordinate_spins(ras)
+                    # And the Add here spins, or adding a finding after a
+                    # proposal would put it at the raw click while the mask
+                    # beside it was grown from the focus.
+                    self._set_manual_spins(ras)
+                    self._apply_target_to_views(recenter=False)
+        try:
+            seed = ras_to_voxel(volume.affine, ras)
+        except Exception:
+            return
+        sensitivity = float(self.sensitivity_spin.value())
+        radius_mm = float(self.roi_radius_spin.value())
+        mask, details = segment_lesion(
+            volume.data,
+            seed,
+            volume.voxel_sizes,
+            dark=self.current_modality != "qsm",
+            sensitivity=sensitivity,
+            radius_mm=radius_mm,
+        )
+        self.preview_mask = mask
+        self.preview_details = details
+        self.preview_ras = tuple(float(value) for value in ras)
+        self.preview_modality = self.current_modality
+        self.preview_snapped_mm = float(snapped_by)
+        for panel in self.view_panels.values():
+            panel.canvas.set_preview_mask(mask)
+        self._refresh_preview_readout()
+
+    def _on_grow_parameter_changed(self, _value: float) -> None:
+        """Re-grow what is on offer, so the numbers describe what is drawn."""
+
+        if self.preview_mask is not None:
+            self.propose_mask(because="clicked")
+
+    def _clear_preview(self) -> None:
+        if self.preview_mask is None and self.preview_details is None:
+            self._refresh_preview_readout()
+            return
+        self.preview_mask = None
+        self.preview_details = None
+        self.preview_ras = None
+        self.preview_modality = None
+        self.preview_snapped_mm = 0.0
+        for panel in self.view_panels.values():
+            panel.canvas.set_preview_mask(None)
+        self._refresh_preview_readout()
+
+    def _refresh_preview_readout(self) -> None:
+        """What is being proposed, and what is wrong with it.
+
+        The warnings are the point.  A grow stops for two reasons that are not
+        "the lesion ends here" -- it hit the radius cap, or it never left the
+        seed -- and in a mode where one key accepts, those have to be next to
+        the key rather than in the status bar.
+        """
+
+        if not hasattr(self, "preview_label"):
+            return
+        if not self.semi_automatic():
+            self.preview_label.setVisible(False)
+            return
+        self.preview_label.setVisible(True)
+        if self.preview_mask is None:
+            reason = self._preview_is_possible()
+            if self._has_own_mask():
+                self.preview_label.setText("Your own mask is shown. Y accepts it as it is.")
+                self.preview_label.setStyleSheet(f"color:{COLORS['dim']}; font-size:8pt;")
+            elif reason and reason != "not in semi-automatic mode":
+                self.preview_label.setText(reason)
+                self.preview_label.setStyleSheet(f"color:{COLORS['warn']}; font-size:8pt;")
+            else:
+                self.preview_label.setText("No mask proposed. Click the lesion to propose one.")
+                self.preview_label.setStyleSheet(f"color:{COLORS['dim']}; font-size:8pt;")
+            return
+        details = self.preview_details or {}
+        voxels = int(details.get("voxel_count", 0))
+        volume_mm3 = float(details.get("volume_mm3", 0.0))
+        diameter = float(details.get("diameter_mm", 0.0))
+        where = MODALITY_SHORT_LABELS.get(self.preview_modality or "", "")
+        text = (
+            f"Proposed on {where}: {volume_mm3:.1f} mm³ · ø {diameter:.1f} mm · "
+            f"{_human_count(voxels, 'voxel')}"
+        )
+        if self.preview_snapped_mm >= 0.05:
+            text += f" · settled {self.preview_snapped_mm:.1f} mm onto the focus"
+
+        colour = COLORS["preview"]
+        if voxels <= 1:
+            text += "  —  it never left the seed; click nearer the centre or lower the sensitivity"
+            colour = COLORS["warn"]
+        elif details.get("reached_cap"):
+            # A note, not a warning: 41% of round-1 proposals touch the cap and
+            # they are nearly all right (median Dice 0.957).  An orange line on
+            # four findings in ten teaches the reader not to look at orange.
+            text += "  \u00b7  stopped at the max r cap; check the edge"
+            colour = COLORS["dim"]
+        self.preview_label.setText(text)
+        self.preview_label.setStyleSheet(f"color:{colour}; font-size:8pt;")
+
+    def _commit_preview(self) -> bool:
+        """Write the proposal into this reader's own segmentation."""
+
+        if self.preview_mask is None or self.selected_target is None:
+            return False
+        if self.label_volume is None:
+            return False
+        target_id = str(self.selected_target["target_id"])
+        value = self._label_value_for(target_id)
+        mask = self.preview_mask
+        self._record_roi_mask_change((self.label_volume == value) | mask)
+        self.label_volume[self.label_volume == value] = 0
+        self.label_volume[mask] = value
+        self.label_sources[target_id] = self.preview_modality or self.current_modality
+        # Not plain "grow": the operation is the same, but a mask a reader
+        # asked for and a mask a reader was offered are different evidence,
+        # and one key to accept will raise the acceptance rate.  Recording it
+        # is what keeps "did these come out different?" answerable.
+        self.label_methods[target_id] = "semiauto"
+        self.label_settings[target_id] = {
+            "sensitivity": float(self.sensitivity_spin.value()),
+            "radius_mm": float(self.roi_radius_spin.value()),
+        }
+        self.last_segmentation = self.preview_details
+        self._semi_auto_masks.add(target_id)
+        self._roi_dirty = True
+        self._mark_review_dirty()
+        self._clear_preview()
+        self._apply_labels_to_views()
+        self._update_roi_readout()
+        return True
+
+    def accept_finding(self) -> None:
+        """Y in semi-automatic mode: the position, the mask and the verdict.
+
+        One key for the three things a reader decides about a finding, in the
+        order they decide them.  It is deliberately not the default action of
+        anything: the mask is right about two-thirds of the time here, so the
+        third that is not has to be caught by somebody looking.
+        """
+
+        if self.selected_target is None:
+            self._set_status("Select a finding first.", COLORS["warn"])
+            return
+        # One voxel is a grow that never left the seed (5% of proposals on
+        # round 1).  Accepting it would store a mask of nothing.
+        if self.preview_mask is not None and int(np.count_nonzero(self.preview_mask)) <= 1:
+            self._set_status(
+                "The proposal never left the seed. Click nearer the centre of the lesion, "
+                f"press {self._shortcut_text('sensitivity_down')} to grow larger, "
+                f"or {self._shortcut_text('tool_brush')} to draw it.",
+                COLORS["warn"],
+            )
+            return
+        # "How sure" was filled in on 274 of 276 manual reads, 259 of them
+        # definite.  Y alone would leave it empty; a choice made first stands.
+        if not str(self.certainty_combo.currentData() or ""):
+            self._set_combo_value(self.certainty_combo, "definite")
+        # The position first: the mask was grown from it, and the two have to
+        # be recorded as belonging together -- exactly that point, not snapped
+        # again on the way into the record.
+        if self.preview_ras is not None:
+            self.target_ras = tuple(float(value) for value in self.preview_ras)
+        if self.target_ras is not None and self.marker_ras is not None:
+            moved = _distance_mm(self.target_ras, self.marker_ras) or 0.0
+            if moved > 1e-6:
+                self.move_finding_here(snap=False)
+        self._commit_preview()
+        self._show_verdict(1)
+        self._mark_review_dirty()
+        self.save_current_review(advance=True)
+
+    def reject_finding(self) -> None:
+        """N in semi-automatic mode: not a microbleed, nothing to draw."""
+
+        if self.selected_target is None:
+            self._set_status("Select a finding first.", COLORS["warn"])
+            return
+        own = self._selected_label_mask()
+        has_mask = own is not None and bool(own.any())
+        details = self._ask_no_details(has_mask)
+        if details is None:
+            self._set_status("Not saved.", COLORS["dim"])
+            return
+        self._clear_preview()
+        if has_mask:
+            # "Not a microbleed" with a mask attached is a contradiction the
+            # export would carry into the training data.  Undoable.
+            self.clear_roi()
+        self._set_combo_value(self.certainty_combo, details.get("certainty") or "definite")
+        self._set_combo_value(self.mimic_combo, details.get("mimic") or "")
+        self.comment_edit.setPlainText(str(details.get("comment") or ""))
+        self._show_verdict(0)
+        self._mark_review_dirty()
+        self.save_current_review(advance=True)
+
+    def _ask_no_details(self, has_mask: bool) -> dict[str, str] | None:
+        """How sure, what it is instead, and a comment -- or None to go back."""
+
+        dialog = NoVerdictDialog(
+            self,
+            certainty=str(self.certainty_combo.currentData() or "") or "definite",
+            mimic=str(self.mimic_combo.currentData() or ""),
+            comment=self.comment_edit.toPlainText(),
+            has_mask=has_mask,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.details()
+
+    def _semi_auto_verdict(self, value: int | None) -> None:
+        """The verdict keys, which commit in semi-automatic mode."""
+
+        if not self.semi_automatic() or self.selected_target is None:
+            self.set_verdict(value)
+            return
+        if value == 1:
+            self.accept_finding()
+        elif value == 0:
+            self.reject_finding()
+        else:
+            self.set_verdict(value)
 
     def set_verdict(self, value: int | None) -> None:
         """Record a verdict from the keyboard."""
@@ -9566,6 +11034,15 @@ class MicrobleedViewer(QMainWindow):
         self._update_dirty_indicator()
         self._update_finding_buttons()
         self._update_roi_readout()
+        self._show_target_context(target)
+
+    def _show_target_context(self, target: dict[str, Any]) -> None:
+        """What the sheet and the other readers say about a finding.
+
+        Separate from the form so other readers' newest work can be shown
+        without resetting what this reader is typing.
+        """
+
         # One line of source context, so the reader does not have to open the
         # Reports section for the facts that matter while deciding.
         summary = [str(target.get("atlasregion") or "no region recorded")]
@@ -9617,6 +11094,8 @@ class MicrobleedViewer(QMainWindow):
             self.reports_browser.setPlainText("\n\n".join(lines))
 
     def _mark_review_dirty(self) -> None:
+        if self.read_only:
+            return
         if not self._updating_form:
             self._review_dirty = True
             self._update_dirty_indicator()
@@ -9628,6 +11107,10 @@ class MicrobleedViewer(QMainWindow):
             self.dirty_label.setText("unsaved · ROI" if self._roi_dirty else "unsaved")
 
     def _confirm_dirty(self) -> bool:
+        if self.read_only:
+            # Nothing typed here can be saved, so there is nothing to ask about.
+            self._review_dirty = False
+            return True
         if not self._review_dirty or self.selected_target is None:
             return True
         prompt = QMessageBox(self)
@@ -9650,6 +11133,9 @@ class MicrobleedViewer(QMainWindow):
         return False
 
     def save_current_review(self, *, advance: bool | None = None) -> bool:
+        if self.read_only:
+            self._set_status("Read-only session: nothing can be saved in this window.", COLORS["warn"])
+            return False
         if self.selected_target is None or self.current_case_id is None:
             self._set_status("Select a source or manual finding before saving a review.", COLORS["warn"])
             return False
@@ -9894,6 +11380,9 @@ class MicrobleedViewer(QMainWindow):
     def remove_manual_microbleed(self) -> None:
         """Delete a finding this reader added, and their own work on it."""
 
+        if self.read_only:
+            self._set_status("Read-only session: nothing can be saved in this window.", COLORS["warn"])
+            return
         if self.selected_target is None:
             self._set_status("Select the finding you want to remove.", COLORS["warn"])
             return
@@ -9973,6 +11462,9 @@ class MicrobleedViewer(QMainWindow):
         self._set_status(f"Removed {label}{detail}.", COLORS["success"])
 
     def add_manual_microbleed(self) -> None:
+        if self.read_only:
+            self._set_status("Read-only session: nothing can be saved in this window.", COLORS["warn"])
+            return
         if self.current_case_id is None:
             QMessageBox.information(self, "No case selected", "Select a case before adding a manual microbleed.")
             return
@@ -10040,15 +11532,25 @@ class MicrobleedViewer(QMainWindow):
         self._session_timer.start()
 
     def _save_session_state(self) -> None:
+        if self.read_only:
+            return
         if self._closing and not self._writer.isRunning():
             return
         state = {
             "case_id": self.current_case_id,
             "target_id": self.selected_target["target_id"] if self.selected_target else None,
             "modality": self.current_modality,
-            "axial": self.view_panels["axial"].canvas.slice_index,
-            "coronal": self.view_panels["coronal"].canvas.slice_index,
-            "sagittal": self.view_panels["sagittal"].canvas.slice_index,
+            # Not while a view is empty: it reports slice 0 then, and that
+            # would be restored as where the reader was.  A case loading
+            # from a NAS is empty long enough for the save timer to fire.
+            **{
+                plane: (
+                    self.view_panels[plane].canvas.slice_index
+                    if self.view_panels[plane].canvas.volume is not None
+                    else None
+                )
+                for plane in ("axial", "coronal", "sagittal")
+            },
             "filters": {
                 "search": self.case_search.text(),
                 "hide_missing": self.hide_missing_cb.isChecked(),
@@ -10098,10 +11600,24 @@ class MicrobleedViewer(QMainWindow):
             details={},
         )
         db_path, session_id = self.db_path, self.session_id
-        self._writer.submit("close session", lambda: close_session(db_path, session_id))
+        if not self.read_only:
+            self._writer.submit("close session", lambda: close_session(db_path, session_id))
         # Everything queued above is written before the thread ends; the wait is
         # bounded so a stuck lock cannot keep the window open.
         self._writer.stop()
+        if self._hub_sync is not None:
+            set_write_listener(None)
+            if not self._hub_sync.stop_and_flush():
+                QMessageBox.information(
+                    self,
+                    "Not yet in the shared folder",
+                    "Your work is saved on this PC, but sending it to the shared folder has "
+                    "not been confirmed. Anything not sent goes automatically the next time "
+                    "you open the viewer on this PC.",
+                )
+                # A copy may still be under way; let it land rather than end
+                # the process underneath it.
+                self._hub_sync.wait(20000)
         event.accept()
 
 
@@ -10183,6 +11699,19 @@ def install_diagnostics(log_path: Path | None = None) -> Path:
         handle.write(f"{stamp} {levels.get(mode, 'message')}: {message}\n")
 
     qInstallMessageHandler(handler)
+
+    # An exception in a Qt callback does not stop the viewer: it is printed
+    # and the event loop carries on, leaving whatever that callback was
+    # halfway through undone.  Printed to a console nobody reads, that looks
+    # like the viewer simply doing the wrong thing.
+    previous_hook = sys.excepthook
+
+    def log_exception(kind, value, trace) -> None:
+        stamp = datetime.now().isoformat(timespec="seconds")
+        handle.write(f"{stamp} error:\n{''.join(traceback.format_exception(kind, value, trace))}")
+        previous_hook(kind, value, trace)
+
+    sys.excepthook = log_exception
     return path
 
 
@@ -10285,6 +11814,78 @@ def _report_source_state(report: dict[str, Any], dataset: Dataset) -> None:
         )
 
 
+def configured_hub(config: dict | None) -> Path | None:
+    """The shared folder this installation uses, if any.
+
+    The environment wins over config.json, as it does for every other path.
+    """
+
+    given = os.environ.get("MICROBLEED_HUB") or str(((config or {}).get("paths") or {}).get("hub") or "")
+    given = given.strip()
+    return Path(given).expanduser() if given else None
+
+
+def remember_hub(config: dict, root: Path, *, path: Path | None = None) -> dict:
+    """Write down that this installation reads from a shared folder."""
+
+    config = dict(config)
+    config["paths"] = {**(config.get("paths") or {}), "hub": str(root)}
+    try:
+        dataset_config.save(config, path)
+    except OSError as exc:
+        QMessageBox.warning(
+            None,
+            "Could not save config.json",
+            f"The shared folder is open, but this choice will not be remembered.\n\n{exc}",
+        )
+    return config
+
+
+def run_shared_folder(app: QApplication, settings: ViewerSettings, root: Path) -> int:
+    """Start on a shared folder: sign in, prepare this PC's copy, open the window."""
+
+    try:
+        shared = hub_store.Hub.open(root)
+    except hub_store.HubError as exc:
+        QMessageBox.critical(
+            None,
+            "Shared folder unavailable",
+            f"{exc}\n\nCheck that this PC is connected to the NAS. To use a different "
+            "folder, change paths.hub in config.json.",
+        )
+        return 2
+    if shared.dataset_config:
+        apply_dataset_config(shared.dataset_config)
+    while True:
+        login = HubLoginDialog(
+            shared,
+            settings=settings,
+            initial_reader=str(settings.store.value("session/last_reader", "") or ""),
+        )
+        if login.exec() != QDialog.DialogCode.Accepted or login.session is None or login.workspace is None:
+            return 0
+        if login.reader_id:
+            settings.store.setValue("session/last_reader", login.reader_id)
+        workspace = login.workspace
+        dataset = Dataset.create(workspace.source_xlsx, shared.data_root, workspace.work_db)
+        _report_source_state(workspace.report, dataset)
+        window = MicrobleedViewer(
+            workspace.work_db,
+            shared.data_root,
+            login.session,
+            settings=settings,
+            dataset=dataset,
+            hub_sync=HubSync(workspace, login.token),
+            read_only=login.read_only,
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        code = app.exec()
+        if not window.sign_in_again:
+            return code
+
+
 def _remember_config(config: dict, dataset: Dataset) -> dict:
     """Apply what the dialog chose, and write it down.
 
@@ -10299,6 +11900,8 @@ def _remember_config(config: dict, dataset: Dataset) -> dict:
         "workbook": str(dataset.workbook),
         "data_root": str(dataset.data_root),
         "review_database": str(dataset.review_db),
+        # Choosing a single-database study means leaving the shared folder.
+        "hub": "",
     }
     applied = apply_dataset_config(config)
     try:
@@ -10336,6 +11939,9 @@ def main() -> int:
             "fix the file or set the format in the dataset dialog.",
         )
         config = apply_dataset_config(None)
+    hub_root = configured_hub(config)
+    if hub_root is not None:
+        return run_shared_folder(app, settings, hub_root)
     # The launcher's environment decides the starting dataset; another one can
     # be opened from the reader dialog before any review begins.
     dataset = default_dataset(config)
@@ -10352,7 +11958,12 @@ def main() -> int:
                 report = None
         if report is None:
             chooser = DatasetDialog(settings, dataset, config=config)
-            if chooser.exec() != QDialog.DialogCode.Accepted or chooser.dataset is None:
+            if chooser.exec() != QDialog.DialogCode.Accepted:
+                return 2
+            if chooser.hub_root is not None:
+                remember_hub(chooser.config, chooser.hub_root)
+                return run_shared_folder(app, settings, chooser.hub_root)
+            if chooser.dataset is None:
                 return 2
             dataset = chooser.dataset
             config = _remember_config(chooser.config, dataset)
@@ -10371,7 +11982,11 @@ def main() -> int:
         if not reader_dialog.change_dataset_requested:
             return 0
         chooser = DatasetDialog(settings, dataset, config=config)
-        if chooser.exec() == QDialog.DialogCode.Accepted and chooser.dataset is not None:
+        accepted = chooser.exec() == QDialog.DialogCode.Accepted
+        if accepted and chooser.hub_root is not None:
+            remember_hub(chooser.config, chooser.hub_root)
+            return run_shared_folder(app, settings, chooser.hub_root)
+        if accepted and chooser.dataset is not None:
             dataset = chooser.dataset
             config = _remember_config(chooser.config, dataset)
 

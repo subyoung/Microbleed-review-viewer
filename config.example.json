@@ -13,9 +13,11 @@
   "dataset_name": "Example study",
 
   "paths": {
+    "_comment": "Or set hub to a shared review folder on the lab NAS (made with tools/hub_admin.py init); the three paths above are then unused.",
     "workbook": "",
     "data_root": "",
-    "review_database": ""
+    "review_database": "",
+    "hub": ""
   },
 
   "workbook": {

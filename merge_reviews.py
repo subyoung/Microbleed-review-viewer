@@ -12,7 +12,7 @@ Usage
 Merge two readers into a fresh aggregate database and export it::
 
     python viewer\\merge_reviews.py --target merged.sqlite ^
-        --source reviews_ziyang.sqlite --source reviews_ella.sqlite ^
+        --source reviews_a.sqlite --source reviews_b.sqlite ^
         --export merged_reviews.xlsx
 
 The target may be an existing aggregate; merging is repeatable, and a review

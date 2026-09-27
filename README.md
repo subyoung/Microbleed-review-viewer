@@ -103,6 +103,28 @@ nothing, with no clue why.
 Every key is rebindable, and the legend in the window always shows the live
 bindings rather than a printed guess.
 
+### Semi-automatic: one key for position, mask and verdict
+
+**Preferences → Reading → Semi-automatic** merges the review and segment panels.
+Landing on a finding nobody has outlined grows a mask there and shows it as a
+cyan outline, waiting to be accepted; nothing is written until it is.
+
+| Key | What it does |
+| --- | --- |
+| click (Point tool) | Propose again from exactly the voxel clicked |
+| `Y` | Save the position, the mask and *yes* — as *definite* unless you chose otherwise — and move on |
+| `N` | Ask how sure, what it is instead and why; save *no*, removing any mask on it |
+| `,` / `.` | Lower / raise the grow sensitivity and regrow — `,` grows it larger |
+| `B` | Take the proposal as your mask and correct it with the brush |
+| `Del` | Drop the proposal, or clear your own mask (`Ctrl+Z` undoes it) |
+| `S` | Hide or show the segmentation and the proposal together |
+
+When a finding opens, the proposal first settles onto the focus next to the
+workbook coordinate; a click is taken as meant and grows from where it landed.
+`Y` refuses a proposal that never left its seed. Measured against the 241 masks
+a reader finished by hand, the proposal matched to Dice ≥ 0.9 two times in
+three; the third is why accepting is a key you press, not a default.
+
 ### Where it is
 
 A reader's opinion is three things: the verdict, the comment, and where the
@@ -163,9 +185,56 @@ the pictures above could be published.
 
 ## Multiple readers
 
-Give each reader their own database — the dataset dialog makes that one field —
-rather than sharing one SQLite file on a synced drive, where concurrent writers
-lose work. Then combine:
+### Reading at the same time from a shared folder
+
+When several readers work at once, put the study in a folder on a shared drive
+(a lab NAS is enough — nothing runs on it) and let everyone open that folder.
+Each reader signs in with a password, works in a copy on their own PC, and sees
+the others' new verdicts within about twenty seconds. No file in the shared
+folder ever has more than one writer, and no SQLite file is opened on the share
+itself, because SQLite over SMB is not safe with several writers.
+
+Set it up once from an existing study (the MRI folder is copied separately):
+
+```powershell
+python tools/hub_admin.py init \\NAS\lab\MicrobleedReview `
+    --from-db review.sqlite --workbook findings.xlsx `
+    --data-root \\NAS\lab\MicrobleedReview\Data
+```
+
+Then each reader, on their own PC, runs the viewer (the standalone build is
+enough), chooses **Use a shared folder…** in the dataset dialog and picks that
+folder — once; it is remembered — or sets `MICROBLEED_HUB`. A reader without a
+password sets one at their first sign-in, and it is asked every time after. The
+password prevents mistakes; it is not access control, since anyone who can write
+to the share can edit the files.
+
+- **Browse read-only** opens the reader selected in the sign-in on one of their
+  rounds — their progress, verdicts and masks — with nothing editable.
+- **Switch…** opens another round of the reader signed in, or goes back to the
+  sign-in for another reader.
+- A reader open on one PC is read-only on any other, so two PCs never write as
+  one reader; one that has gone quiet for three minutes can be taken over.
+- The status bar says when the folder was last synced, and when it cannot be
+  reached: work carries on locally and is sent when it comes back.
+
+`tools/hub_admin.py` is for whoever sets the study up, from a source install:
+
+```powershell
+python tools/hub_admin.py check \\NAS\lab\MicrobleedReview    # is everything a sign-in needs there
+python tools/hub_admin.py list \\NAS\lab\MicrobleedReview
+python tools/hub_admin.py reset-password \\NAS\lab\MicrobleedReview "Reader Name"
+python tools/hub_admin.py export \\NAS\lab\MicrobleedReview all_readers.xlsx
+```
+
+`hub.json` names the workbook and the MRI folder relative to itself, so move the
+shared folder as a whole or not at all.
+
+### Separate databases, merged afterwards
+
+Alternatively, give each reader their own database — the dataset dialog makes
+that one field — rather than sharing one SQLite file on a synced drive, where
+concurrent writers lose work. Then combine:
 
 ```powershell
 python merge_reviews.py --target merged.sqlite `
@@ -227,22 +296,26 @@ reading and starts agreeing.
   thread with a short timeout so they can never freeze the window, while a
   reader's save keeps the full timeout because it has to be told the truth.
 - The viewer warns if the database is in a synced folder.
+- In a shared folder every file has one writer, every write goes to a temporary
+  name and is renamed into place, and SQLite is only ever opened on a local
+  copy.
 
 ## Tests
 
 ```powershell
 $env:QT_QPA_PLATFORM = 'offscreen'
-python -m unittest tests.test_core tests.test_desktop_app
+python -m unittest tests.test_core tests.test_desktop_app tests.test_hub
 ```
 
-Like that, 42 tests run — the geometry, the region growing, the surface and
-projection maths, the store — and the rest are held back as needing a dataset.
+Like that, 139 tests run — the geometry, the region growing, the surface and
+projection maths, the store, the shared folder, and the semi-automatic keys on
+the phantom — and the rest are held back as needing a dataset.
 Point it at a study and the whole suite runs:
 
 ```powershell
 $env:TEST_SOURCE_XLSX = 'C:\studies\findings.xlsx'
 $env:TEST_DATA_ROOT   = 'C:\studies\Data'
-python -m unittest tests.test_core tests.test_desktop_app
+python -m unittest tests.test_core tests.test_desktop_app tests.test_hub
 ```
 
 A study, not the demo phantom: several of these were written against real

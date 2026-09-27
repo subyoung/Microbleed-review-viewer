@@ -102,6 +102,73 @@ class SourceReadError(RuntimeError):
     pass
 
 
+class ReadOnlyError(PermissionError):
+    """A write this session is not allowed to make."""
+
+
+# Who this process may write as.  Off by default, so a single-database setup
+# behaves as it always has.  With readers sharing a NAS folder the local store
+# also holds copies of everybody else's rows, and the guard is what makes
+# "type another reader's name and overwrite their work" impossible rather than
+# merely unlikely.  ``reader`` None with the guard on means read-only.
+_write_guard: dict[str, Any] = {"enabled": False, "reader": None}
+_write_listener: dict[str, Any] = {"callback": None}
+
+
+def set_write_guard(reader_id: str | None, *, enabled: bool = True) -> None:
+    _write_guard["enabled"] = bool(enabled)
+    _write_guard["reader"] = str(reader_id) if reader_id is not None else None
+
+
+def clear_write_guard() -> None:
+    set_write_guard(None, enabled=False)
+
+
+def _check_writer(reader_id: Any) -> None:
+    if not _write_guard["enabled"]:
+        return
+    allowed = _write_guard["reader"]
+    if allowed is None:
+        raise ReadOnlyError("This session is read-only; nothing can be saved.")
+    if reader_id is not None and str(reader_id) != allowed:
+        raise ReadOnlyError(
+            f"This session writes as {allowed}; it cannot change {reader_id}'s work."
+        )
+
+
+def _check_session_writer(db_path: Path, session_id: str) -> None:
+    if not _write_guard["enabled"]:
+        return
+    if _write_guard["reader"] is None:
+        _check_writer(None)
+    connection = connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT reader_id FROM reader_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    _check_writer(row["reader_id"] if row else None)
+
+
+def set_write_listener(callback: Any) -> None:
+    """Called after every write of a reader's work -- how a sync learns to publish."""
+
+    _write_listener["callback"] = callback
+
+
+def _notify_write() -> None:
+    callback = _write_listener["callback"]
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        # A sync that cannot be told is a sync that runs late; the save itself
+        # has already succeeded and must not be reported as failed.
+        pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -638,11 +705,26 @@ def _normalise_source_value(value: Any) -> Any:
         return text
 
 
-def _find_modality_file(folder: Path, modality: str) -> Path | None:
+def _file_names(folder: Path) -> list[str]:
+    """The files in one folder, from a single listing.
+
+    One ``scandir`` and no per-file stat: on Windows the listing already says
+    which entries are files.  The MRI folder can be on a NAS, where each
+    call is a network round trip -- listing every case folder once per
+    sequence and then checking each file separately was about 7,700 of them
+    per start for this study.
+    """
+
+    with os.scandir(folder) as entries:
+        return sorted(entry.name for entry in entries if entry.is_file())
+
+
+def _find_modality_file(folder: Path, modality: str, names: list[str] | None = None) -> Path | None:
     # The review coordinates are only trusted with the AffineRestored
     # products.  Do not fall back to similarly named non-restored NIfTIs.
     spec = MODALITY_SPECS[modality]
-    names = sorted(path.name for path in folder.iterdir() if path.is_file())
+    if names is None:
+        names = _file_names(folder)
     for suffix in spec["suffixes"]:
         matches = [name for name in names if name.endswith(suffix)]
         if matches:
@@ -664,8 +746,9 @@ def refresh_inventory(connection: sqlite3.Connection, data_root: Path) -> dict[s
     for case_id in case_ids:
         folder = data_root / case_id
         folder_exists = folder.is_dir()
+        names = _file_names(folder) if folder_exists else []
         paths = {
-            modality: _find_modality_file(folder, modality) if folder_exists else None
+            modality: _find_modality_file(folder, modality, names) if folder_exists else None
             for modality in MODALITY_SPECS
         }
         available_count = sum(path is not None for path in paths.values())
@@ -1086,6 +1169,7 @@ def list_targets(
 
 def register_reader(db_path: Path, reader_id: str) -> None:
     reader_id = reader_id.strip()
+    _check_writer(reader_id)
     now = utc_now()
     connection = connect(db_path)
     try:
@@ -1221,18 +1305,20 @@ def start_new_session(
             (session_id, reader_id, review_round, now, now, resumed_from_session_id),
         )
         connection.commit()
-        return {
-            "session_id": session_id,
-            "reader_id": reader_id,
-            "review_round": review_round,
-            "started_at": now,
-            "status": "open",
-        }
     finally:
         connection.close()
+    _notify_write()
+    return {
+        "session_id": session_id,
+        "reader_id": reader_id,
+        "review_round": review_round,
+        "started_at": now,
+        "status": "open",
+    }
 
 
 def resume_session(db_path: Path, session_id: str) -> dict[str, Any]:
+    _check_session_writer(db_path, session_id)
     now = utc_now()
     connection = connect(db_path)
     try:
@@ -1246,12 +1332,14 @@ def resume_session(db_path: Path, session_id: str) -> dict[str, Any]:
         ).fetchone()
         if not row:
             raise ValueError(f"Unknown session: {session_id}")
-        return dict(row)
     finally:
         connection.close()
+    _notify_write()
+    return dict(row)
 
 
 def close_session(db_path: Path, session_id: str) -> None:
+    _check_session_writer(db_path, session_id)
     now = utc_now()
     connection = connect(db_path)
     try:
@@ -1262,9 +1350,11 @@ def close_session(db_path: Path, session_id: str) -> None:
         connection.commit()
     finally:
         connection.close()
+    _notify_write()
 
 
 def save_session_state(db_path: Path, session_id: str, state: dict[str, Any]) -> None:
+    _check_session_writer(db_path, session_id)
     connection = connect(db_path)
     try:
         connection.execute(
@@ -1303,6 +1393,8 @@ def log_event(
     target_id: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
+    if _write_guard["enabled"] and (reader_id is not None or _write_guard["reader"] is None):
+        _check_writer(reader_id)
     connection = connect(db_path)
     try:
         connection.execute(
@@ -1360,6 +1452,7 @@ def save_review(
     ``MIMIC_CHOICES``.
     """
 
+    _check_writer(reader_id)
     if verify not in (None, 0, 1):
         raise ValueError("verify must be None, 0, or 1")
     comment = comment.strip() if comment and comment.strip() else None
@@ -1420,6 +1513,7 @@ def save_review(
             "after": {"verify": verify, "comment": comment, "corrected_ras": ras if corrected_ras is not None else None},
         },
     )
+    _notify_write()
 
 
 def add_manual_annotation(
@@ -1433,6 +1527,7 @@ def add_manual_annotation(
     initial_note: str | None = None,
     session_id: str | None = None,
 ) -> str:
+    _check_writer(reader_id)
     values = tuple(float(value) for value in ras)
     if len(values) != 3:
         raise ValueError("A manual annotation requires three RAS values.")
@@ -1475,6 +1570,7 @@ def add_manual_annotation(
         target_id=target_id,
         details={"ras": values, "atlasregion": atlasregion, "initial_note": initial_note},
     )
+    _notify_write()
     return target_id
 
 
@@ -1608,6 +1704,7 @@ def delete_manual_annotation(
     deletion instead -- see :func:`manual_deletion_blockers`.
     """
 
+    _check_writer(reader_id)
     blockers = manual_deletion_blockers(db_path, target_id, reader_id)
     if blockers:
         raise ValueError(" ".join(blockers))
@@ -1643,6 +1740,7 @@ def delete_manual_annotation(
         target_id=str(target_id),
         details={"ras": ras, "reviews": int(reviews or 0), "segmentations": int(segmentations or 0)},
     )
+    _notify_write()
     return {
         "target_id": str(target_id),
         "case_id": case_id,
@@ -2426,8 +2524,14 @@ def merge_stores(target_db: Path, source_dbs: Iterable[Path]) -> dict[str, Any]:
 def label_directory(db_path: Path, reader_id: str) -> Path:
     """Where this reader's segmentations live: beside the review database."""
 
-    safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in reader_id)
-    return Path(db_path).parent / "labels" / (safe or "reader")
+    return Path(db_path).parent / "labels" / safe_reader_name(reader_id)
+
+
+def safe_reader_name(reader_id: str) -> str:
+    """A reader's name as a folder name -- for labels and for a shared hub."""
+
+    safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in str(reader_id))
+    return safe or "reader"
 
 
 def label_path(db_path: Path, case_id: str, reader_id: str, review_round: int) -> Path:
@@ -2470,12 +2574,34 @@ def resolve_label_path(db_path: Path, row: Any) -> Path:
             candidate = Path(db_path).parent / candidate
         if candidate.is_file():
             return candidate
-    return label_path(
+    local = label_path(
         Path(db_path),
         str(row["case_id"]),
         str(row["reader_id"]),
         int(row["review_round"]),
     )
+    if local.is_file():
+        return local
+    # Another reader's mask is not beside this store at all: it is in the
+    # shared folder, at the same relative path it has beside theirs.
+    relative = local.relative_to(Path(db_path).parent)
+    for root in _label_search_roots:
+        for candidate in (
+            (Path(root) / recorded) if recorded and not Path(recorded).is_absolute() else None,
+            Path(root) / relative,
+        ):
+            if candidate is not None and candidate.is_file():
+                return candidate
+    return local
+
+
+_label_search_roots: list[Path] = []
+
+
+def set_label_search_roots(roots: Iterable[Path]) -> None:
+    """Folders to look in for a mask that is not beside this store."""
+
+    _label_search_roots[:] = [Path(root) for root in roots]
 
 
 def relative_label_path(db_path: Path, path: Path) -> str:
@@ -2515,6 +2641,7 @@ def save_roi(
     volume in the results table cannot be reproduced or compared.
     """
 
+    _check_writer(reader_id)
     now = utc_now()
     connection = connect(db_path)
     try:
@@ -2585,6 +2712,7 @@ def save_roi(
             "generated_from": generated_from,
         },
     )
+    _notify_write()
 
 
 def recent_case_log(db_path: Path, case_id: str, limit: int = 25) -> list[dict[str, Any]]:
@@ -2600,5 +2728,154 @@ def recent_case_log(db_path: Path, case_id: str, limit: int = 25) -> list[dict[s
             (case_id, int(limit)),
         ).fetchall()
         return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+# ------------------------------------------------------------------ snapshots
+# A reader's snapshot is a copy of their store holding only their own work.
+# Readers sharing a folder each publish one and import everybody else's, so no
+# file in the shared folder ever has more than one writer.
+
+# Each table that holds a reader's work, and the column that says whose.
+READER_TABLES: tuple[tuple[str, str], ...] = (
+    ("reader_profiles", "reader_id"),
+    ("reader_sessions", "reader_id"),
+    ("review_annotations", "reader_id"),
+    ("manual_annotations", "created_by"),
+    ("roi_labels", "reader_id"),
+    ("operation_log", "reader_id"),
+)
+# Row ids that only mean something inside one store.
+_LOCAL_IDS = {"review_annotations": "review_id", "roi_labels": "roi_id", "operation_log": "log_id"}
+_SNAPSHOT_COUNTS = (
+    ("reviews", "review_annotations"),
+    ("rois", "roi_labels"),
+    ("manual", "manual_annotations"),
+    ("sessions", "reader_sessions"),
+    ("log", "operation_log"),
+)
+
+
+def export_reader_snapshot(db_path: Path, reader_id: str, out_path: Path, *, revision: int) -> dict[str, Any]:
+    """Write ``reader_id``'s own work, and nothing else, to ``out_path``."""
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    for leftover in (out_path, *(Path(f"{out_path}{suffix}") for suffix in ("-wal", "-shm", "-journal"))):
+        if leftover.exists():
+            leftover.unlink()
+    source = connect(Path(db_path))
+    target = sqlite3.connect(str(out_path))
+    try:
+        source.backup(target)
+    finally:
+        source.close()
+    try:
+        # The copy inherits WAL from the working store; a published file has
+        # to be one self-contained file.
+        target.execute("PRAGMA journal_mode = DELETE")
+        for table, owner in READER_TABLES:
+            target.execute(f"DELETE FROM {table} WHERE {owner} IS NOT ?", (str(reader_id),))  # noqa: S608
+        # Rows merged in from another store are not this reader's to publish.
+        target.execute("DELETE FROM operation_log WHERE origin_store_id IS NOT NULL")
+        target.execute("DELETE FROM source_microbleeds")
+        target.execute("DELETE FROM case_inventory")
+        counts = {
+            key: int(target.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])  # noqa: S608
+            for key, table in _SNAPSHOT_COUNTS
+        }
+        for key, value in (
+            ("snapshot_reader", str(reader_id)),
+            ("revision", int(revision)),
+            ("published_at", utc_now()),
+        ):
+            target.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+        target.commit()
+        target.execute("VACUUM")
+    finally:
+        target.close()
+    return counts
+
+
+def _columns(connection: sqlite3.Connection, schema: str, table: str) -> list[str]:
+    return [str(row[1]) for row in connection.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def read_snapshot_meta(snapshot_path: Path) -> dict[str, str]:
+    connection = sqlite3.connect(f"file:{Path(snapshot_path).as_posix()}?mode=ro", uri=True)
+    try:
+        return {str(key): str(value) for key, value in connection.execute("SELECT key, value FROM meta")}
+    finally:
+        connection.close()
+
+
+def import_reader_snapshot(db_path: Path, snapshot_path: Path, *, own: bool = False) -> dict[str, Any]:
+    """Replace one reader's rows in this store with the rows of their snapshot.
+
+    The snapshot is the whole truth about that reader, so their rows are
+    deleted and re-inserted rather than merged: something they removed is
+    removed here too, and importing the same snapshot twice changes nothing.
+
+    ``own`` is for restoring this store's own reader from the shared copy --
+    their log rows are then this store's own again rather than imported ones.
+    Not subject to the write guard: this is how other readers' work arrives.
+    """
+
+    connection = connect(Path(db_path))
+    try:
+        _schema(connection)
+        connection.execute("ATTACH DATABASE ? AS snap", (str(snapshot_path),))
+        try:
+            meta = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute("SELECT key, value FROM snap.meta")
+            }
+            reader = meta.get("snapshot_reader")
+            if not reader:
+                raise ValueError(f"{snapshot_path} is not a reader snapshot.")
+            store_id = meta.get("store_id")
+            summary: dict[str, Any] = {"reader_id": reader, "revision": int(meta.get("revision") or 0)}
+            owners = dict(READER_TABLES)
+            try:
+                connection.execute("BEGIN")
+                for table, owner in READER_TABLES:
+                    connection.execute(f"DELETE FROM main.{table} WHERE {owner} = ?", (reader,))  # noqa: S608
+                    present = set(_columns(connection, "snap", table))
+                    columns = [
+                        column
+                        for column in _columns(connection, "main", table)
+                        if column in present
+                        and column != _LOCAL_IDS.get(table)
+                        and column not in ("origin_store_id", "origin_log_id")
+                    ]
+                    selected = list(columns)
+                    args: tuple[Any, ...] = ()
+                    if table == "operation_log" and not own:
+                        columns += ["origin_store_id", "origin_log_id"]
+                        selected += ["?", "log_id"]
+                        args = (store_id,)
+                    connection.execute(
+                        f"INSERT INTO main.{table}({', '.join(columns)}) "  # noqa: S608
+                        f"SELECT {', '.join(selected)} FROM snap.{table} WHERE {owner} = ?",
+                        (*args, reader),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            for key, table in _SNAPSHOT_COUNTS:
+                summary[key] = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM main.{table} WHERE {owners[table]} = ?", (reader,)  # noqa: S608
+                    ).fetchone()[0]
+                )
+            return summary
+        finally:
+            connection.execute("DETACH DATABASE snap")
     finally:
         connection.close()

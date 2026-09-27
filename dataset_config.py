@@ -34,6 +34,9 @@ DEFAULTS: dict[str, Any] = {
         "workbook": "",
         "data_root": "",
         "review_database": "",
+        # A shared review folder on a NAS (see hub.py).  When set, the three
+        # paths above are not used: the folder says where everything is.
+        "hub": "",
     },
     "workbook": {
         "sheet": "MCH-microhemorrage",

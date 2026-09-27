@@ -9,3 +9,7 @@
 $env:MICROBLEED_SOURCE_XLSX = Join-Path $projectDir "microbleeds.xlsx"
 $env:MICROBLEED_DATA_ROOT = Join-Path $projectDir "Data"
 $env:MICROBLEED_REVIEW_DB = Join-Path $viewerDir "microbleed_review_data.sqlite"
+
+# Or, to read from a shared review folder on the lab NAS instead (the three
+# lines above are then ignored):
+# $env:MICROBLEED_HUB = "\\NAS\lab\MicrobleedReview"
